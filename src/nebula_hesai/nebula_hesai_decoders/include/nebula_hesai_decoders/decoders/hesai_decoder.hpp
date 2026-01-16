@@ -23,6 +23,10 @@
 #include "nebula_hesai_decoders/decoders/hesai_scan_decoder.hpp"
 #include "nebula_hesai_decoders/decoders/packet_loss_detector.hpp"
 
+#ifdef NEBULA_CUDA_ENABLED
+#include "nebula_hesai_decoders/decoders/cuda/hesai_cuda_decoder.hpp"
+#endif
+
 #include <nebula_core_common/loggers/logger.hpp>
 #include <nebula_core_common/nebula_common.hpp>
 #include <nebula_core_common/point_types.hpp>
@@ -103,6 +107,35 @@ private:
   /// @brief Decoded data of the frame currently being output
   DecodeFrame output_frame_;
 
+#ifdef NEBULA_CUDA_ENABLED
+  /// @brief CUDA decoder for GPU-accelerated point cloud processing
+  std::unique_ptr<cuda::HesaiCudaDecoder> cuda_decoder_;
+  /// @brief CUDA stream for async operations
+  cudaStream_t cuda_stream_ = nullptr;
+  /// @brief Whether CUDA decoding is enabled and initialized
+  bool cuda_enabled_ = false;
+  /// @brief Number of azimuth divisions for angle lookup table
+  static constexpr uint32_t cuda_n_azimuths_ = 36000;  // 0.01 degree resolution
+  /// @brief Device memory for output points
+  cuda::CudaNebulaPoint * d_points_ = nullptr;
+  /// @brief Device memory for output count
+  uint32_t * d_count_ = nullptr;
+  /// @brief Host buffer for CUDA results
+  std::vector<cuda::CudaNebulaPoint> cuda_point_buffer_;
+  /// @brief Pre-allocated device memory for distances (avoid per-packet malloc)
+  uint16_t * d_distances_ = nullptr;
+  /// @brief Pre-allocated device memory for reflectivities (avoid per-packet malloc)
+  uint8_t * d_reflectivities_ = nullptr;
+  /// @brief Pre-allocated device memory for decoder config (avoid per-packet malloc)
+  cuda::CudaDecoderConfig * d_config_ = nullptr;
+  /// @brief Pinned host memory for distances (faster CPU->GPU transfer)
+  uint16_t * h_pinned_distances_ = nullptr;
+  /// @brief Pinned host memory for reflectivities (faster CPU->GPU transfer)
+  uint8_t * h_pinned_reflectivities_ = nullptr;
+  /// @brief Size of pre-allocated buffers (n_channels * max_returns)
+  size_t cuda_buffer_size_ = 0;
+#endif
+
   /// @brief Validates and parse PandarPacket. Checks size and, if present, CRC checksums.
   /// @param packet The incoming PandarPacket
   /// @return Whether the packet was parsed successfully
@@ -122,6 +155,114 @@ private:
 
     return true;
   }
+
+#ifdef NEBULA_CUDA_ENABLED
+  /// @brief CUDA-accelerated conversion of returns to points
+  /// @param start_block_id The first block in the group of returns
+  /// @param n_blocks The number of returns in the group
+  void convert_returns_cuda(size_t start_block_id, size_t n_blocks)
+  {
+    if (!cuda_enabled_) {
+      convert_returns(start_block_id, n_blocks);
+      return;
+    }
+
+    uint64_t packet_timestamp_ns = hesai_packet::get_timestamp_ns(packet_);
+    uint32_t raw_azimuth = packet_.body.blocks[start_block_id].get_azimuth();
+
+    // Prepare decoder config
+    cuda::CudaDecoderConfig config;
+    config.min_range = sensor_configuration_->min_range;
+    config.max_range = sensor_configuration_->max_range;
+    config.sensor_min_range = SensorT::min_range;
+    config.sensor_max_range = SensorT::max_range;
+    config.dual_return_distance_threshold = sensor_configuration_->dual_return_distance_threshold;
+    config.fov_min_rad = scan_cut_angles_.fov_min;
+    config.fov_max_rad = scan_cut_angles_.fov_max;
+    config.scan_emit_angle_rad = scan_cut_angles_.scan_emit_angle;
+    config.n_channels = SensorT::packet_t::n_channels;
+    config.n_blocks = n_blocks;
+    config.max_returns = n_blocks;
+    config.dis_unit = hesai_packet::get_dis_unit(packet_);
+
+    // Extract distances and reflectivities from packet into pinned host memory
+    const size_t data_size = config.n_channels * n_blocks;
+    for (size_t channel_id = 0; channel_id < config.n_channels; ++channel_id) {
+      for (size_t block_offset = 0; block_offset < n_blocks; ++block_offset) {
+        const auto & unit = packet_.body.blocks[block_offset + start_block_id].units[channel_id];
+        size_t idx = channel_id * n_blocks + block_offset;
+        h_pinned_distances_[idx] = unit.distance;
+        h_pinned_reflectivities_[idx] = unit.reflectivity;
+      }
+    }
+
+    // Reset output count
+    cudaMemsetAsync(d_count_, 0, sizeof(uint32_t), cuda_stream_);
+
+    // Copy data to device using pre-allocated buffers and pinned memory (faster transfer)
+    cudaMemcpyAsync(d_distances_, h_pinned_distances_, data_size * sizeof(uint16_t),
+                    cudaMemcpyHostToDevice, cuda_stream_);
+    cudaMemcpyAsync(d_reflectivities_, h_pinned_reflectivities_, data_size * sizeof(uint8_t),
+                    cudaMemcpyHostToDevice, cuda_stream_);
+    cudaMemcpyAsync(d_config_, &config, sizeof(cuda::CudaDecoderConfig),
+                    cudaMemcpyHostToDevice, cuda_stream_);
+
+    // Launch kernel (calls into the CUDA library)
+    cuda_decoder_->decode_packet(
+      reinterpret_cast<const uint8_t *>(&packet_),
+      sizeof(packet_),
+      config,
+      d_points_,
+      d_count_,
+      cuda_stream_);
+
+    // Synchronize and copy results back
+    cudaStreamSynchronize(cuda_stream_);
+
+    uint32_t point_count = 0;
+    cudaMemcpy(&point_count, d_count_, sizeof(uint32_t), cudaMemcpyDeviceToHost);
+
+    if (point_count > 0) {
+      point_count = std::min(point_count, static_cast<uint32_t>(cuda_point_buffer_.size()));
+      cudaMemcpy(cuda_point_buffer_.data(), d_points_,
+                 point_count * sizeof(cuda::CudaNebulaPoint), cudaMemcpyDeviceToHost);
+
+      // Convert CUDA points to Nebula points and add to pointcloud
+      for (uint32_t i = 0; i < point_count; ++i) {
+        const auto & cuda_pt = cuda_point_buffer_[i];
+
+        // Check if point is in current scan or output scan based on azimuth
+        bool in_current_scan = true;
+        if (angle_corrector_.is_inside_overlap(last_azimuth_, raw_azimuth) &&
+            angle_is_between(
+              scan_cut_angles_.scan_emit_angle, scan_cut_angles_.scan_emit_angle + deg2rad(20),
+              cuda_pt.azimuth)) {
+          in_current_scan = false;
+        }
+
+        auto & frame = in_current_scan ? decode_frame_ : output_frame_;
+
+        NebulaPoint point;
+        point.x = cuda_pt.x;
+        point.y = cuda_pt.y;
+        point.z = cuda_pt.z;
+        point.distance = cuda_pt.distance;
+        point.azimuth = cuda_pt.azimuth;
+        point.elevation = cuda_pt.elevation;
+        point.intensity = cuda_pt.intensity;
+        point.return_type = cuda_pt.return_type;
+        point.channel = cuda_pt.channel;
+        point.time_stamp = get_point_time_relative(
+          frame.scan_timestamp_ns, packet_timestamp_ns, start_block_id, cuda_pt.channel);
+
+        if (!mask_filter_ || !mask_filter_->excluded(point)) {
+          frame.pointcloud->emplace_back(point);
+        }
+      }
+    }
+    // No cleanup needed - using pre-allocated buffers
+  }
+#endif
 
   /// @brief Converts a group of returns (i.e. 1 for single return, 2 for dual return, etc.) to
   /// points and appends them to the point cloud
@@ -343,7 +484,188 @@ public:
         SensorT::peak_resolution_mdeg.azimuth, SensorT::packet_t::n_channels,
         logger_->child("Downsample Mask"), true, sensor_.get_dither_transform());
     }
+
+#ifdef NEBULA_CUDA_ENABLED
+    initialize_cuda();
+#endif
   }
+
+#ifdef NEBULA_CUDA_ENABLED
+  /// @brief Initialize CUDA decoder and upload angle corrections
+  void initialize_cuda()
+  {
+    // Create CUDA stream
+    cudaError_t err = cudaStreamCreate(&cuda_stream_);
+    if (err != cudaSuccess) {
+      NEBULA_LOG_STREAM(logger_->warn, "Failed to create CUDA stream: " << cudaGetErrorString(err));
+      return;
+    }
+
+    // Initialize CUDA decoder
+    cuda_decoder_ = std::make_unique<cuda::HesaiCudaDecoder>();
+    const size_t max_points = SensorT::max_scan_buffer_points;
+    const uint32_t n_channels = SensorT::packet_t::n_channels;
+
+    if (!cuda_decoder_->initialize(max_points, n_channels)) {
+      NEBULA_LOG_STREAM(logger_->warn, "Failed to initialize CUDA decoder");
+      cuda_decoder_.reset();
+      return;
+    }
+
+    // Allocate device memory for output
+    err = cudaMalloc(&d_points_, max_points * sizeof(cuda::CudaNebulaPoint));
+    if (err != cudaSuccess) {
+      NEBULA_LOG_STREAM(logger_->warn, "Failed to allocate CUDA output points");
+      cuda_decoder_.reset();
+      return;
+    }
+
+    err = cudaMalloc(&d_count_, sizeof(uint32_t));
+    if (err != cudaSuccess) {
+      cudaFree(d_points_);
+      d_points_ = nullptr;
+      NEBULA_LOG_STREAM(logger_->warn, "Failed to allocate CUDA output count");
+      cuda_decoder_.reset();
+      return;
+    }
+
+    // Pre-allocate buffers for per-packet data (avoid cudaMalloc/cudaFree per packet)
+    // Buffer size = n_channels * max_returns (typically 128 * 2 = 256 for dual return)
+    cuda_buffer_size_ = n_channels * SensorT::packet_t::max_returns;
+
+    err = cudaMalloc(&d_distances_, cuda_buffer_size_ * sizeof(uint16_t));
+    if (err != cudaSuccess) {
+      cudaFree(d_points_);
+      cudaFree(d_count_);
+      d_points_ = nullptr;
+      d_count_ = nullptr;
+      NEBULA_LOG_STREAM(logger_->warn, "Failed to allocate CUDA distances buffer");
+      cuda_decoder_.reset();
+      return;
+    }
+
+    err = cudaMalloc(&d_reflectivities_, cuda_buffer_size_ * sizeof(uint8_t));
+    if (err != cudaSuccess) {
+      cudaFree(d_points_);
+      cudaFree(d_count_);
+      cudaFree(d_distances_);
+      d_points_ = nullptr;
+      d_count_ = nullptr;
+      d_distances_ = nullptr;
+      NEBULA_LOG_STREAM(logger_->warn, "Failed to allocate CUDA reflectivities buffer");
+      cuda_decoder_.reset();
+      return;
+    }
+
+    err = cudaMalloc(&d_config_, sizeof(cuda::CudaDecoderConfig));
+    if (err != cudaSuccess) {
+      cudaFree(d_points_);
+      cudaFree(d_count_);
+      cudaFree(d_distances_);
+      cudaFree(d_reflectivities_);
+      d_points_ = nullptr;
+      d_count_ = nullptr;
+      d_distances_ = nullptr;
+      d_reflectivities_ = nullptr;
+      NEBULA_LOG_STREAM(logger_->warn, "Failed to allocate CUDA config buffer");
+      cuda_decoder_.reset();
+      return;
+    }
+
+    // Allocate pinned host memory for faster CPU->GPU transfers
+    err = cudaMallocHost(&h_pinned_distances_, cuda_buffer_size_ * sizeof(uint16_t));
+    if (err != cudaSuccess) {
+      cudaFree(d_points_);
+      cudaFree(d_count_);
+      cudaFree(d_distances_);
+      cudaFree(d_reflectivities_);
+      cudaFree(d_config_);
+      d_points_ = nullptr;
+      d_count_ = nullptr;
+      d_distances_ = nullptr;
+      d_reflectivities_ = nullptr;
+      d_config_ = nullptr;
+      NEBULA_LOG_STREAM(logger_->warn, "Failed to allocate pinned distances buffer");
+      cuda_decoder_.reset();
+      return;
+    }
+
+    err = cudaMallocHost(&h_pinned_reflectivities_, cuda_buffer_size_ * sizeof(uint8_t));
+    if (err != cudaSuccess) {
+      cudaFree(d_points_);
+      cudaFree(d_count_);
+      cudaFree(d_distances_);
+      cudaFree(d_reflectivities_);
+      cudaFree(d_config_);
+      cudaFreeHost(h_pinned_distances_);
+      d_points_ = nullptr;
+      d_count_ = nullptr;
+      d_distances_ = nullptr;
+      d_reflectivities_ = nullptr;
+      d_config_ = nullptr;
+      h_pinned_distances_ = nullptr;
+      NEBULA_LOG_STREAM(logger_->warn, "Failed to allocate pinned reflectivities buffer");
+      cuda_decoder_.reset();
+      return;
+    }
+
+    // Pre-allocate host buffer for results
+    cuda_point_buffer_.resize(max_points);
+
+    // Build and upload angle correction lookup table
+    std::vector<cuda::CudaAngleCorrectionData> angle_lut;
+    angle_lut.reserve(cuda_n_azimuths_ * n_channels);
+
+    for (uint32_t azimuth = 0; azimuth < cuda_n_azimuths_; ++azimuth) {
+      for (uint32_t channel = 0; channel < n_channels; ++channel) {
+        CorrectedAngleData cpu_data = angle_corrector_.get_corrected_angle_data(azimuth, channel);
+        cuda::CudaAngleCorrectionData gpu_data;
+        gpu_data.azimuth_rad = cpu_data.azimuth_rad;
+        gpu_data.elevation_rad = cpu_data.elevation_rad;
+        gpu_data.sin_azimuth = cpu_data.sin_azimuth;
+        gpu_data.cos_azimuth = cpu_data.cos_azimuth;
+        gpu_data.sin_elevation = cpu_data.sin_elevation;
+        gpu_data.cos_elevation = cpu_data.cos_elevation;
+        angle_lut.push_back(gpu_data);
+      }
+    }
+
+    cuda_decoder_->upload_angle_corrections(angle_lut, cuda_n_azimuths_, n_channels);
+
+    cuda_enabled_ = true;
+    NEBULA_LOG_STREAM(logger_->info, "CUDA decoder initialized successfully with "
+      << n_channels << " channels and " << cuda_n_azimuths_ << " azimuth divisions");
+  }
+
+  /// @brief Cleanup CUDA resources
+  ~HesaiDecoder()
+  {
+    if (d_points_) {
+      cudaFree(d_points_);
+    }
+    if (d_count_) {
+      cudaFree(d_count_);
+    }
+    if (d_distances_) {
+      cudaFree(d_distances_);
+    }
+    if (d_reflectivities_) {
+      cudaFree(d_reflectivities_);
+    }
+    if (d_config_) {
+      cudaFree(d_config_);
+    }
+    if (h_pinned_distances_) {
+      cudaFreeHost(h_pinned_distances_);
+    }
+    if (h_pinned_reflectivities_) {
+      cudaFreeHost(h_pinned_reflectivities_);
+    }
+    if (cuda_stream_) {
+      cudaStreamDestroy(cuda_stream_);
+    }
+  }
+#endif
 
   void set_pointcloud_callback(pointcloud_callback_t callback) override
   {
@@ -411,7 +733,15 @@ public:
         continue;
       }
 
+#ifdef NEBULA_CUDA_ENABLED
+      if (cuda_enabled_) {
+        convert_returns_cuda(block_id, n_returns);
+      } else {
+        convert_returns(block_id, n_returns);
+      }
+#else
       convert_returns(block_id, n_returns);
+#endif
 
       if (angle_corrector_.passed_emit_angle(last_azimuth_, block_azimuth)) {
         // The current `decode` pointcloud is ready for publishing, swap buffers to continue with
