@@ -313,5 +313,6 @@ void RobosenseRosWrapper::receive_cloud_packet_callback(std::vector<uint8_t> & p
   decoder_wrapper_->process_cloud_packet(std::move(msg_ptr));
 }
 
-RCLCPP_COMPONENTS_REGISTER_NODE(RobosenseRosWrapper)
 }  // namespace nebula::ros
+
+RCLCPP_COMPONENTS_REGISTER_NODE(nebula::ros::RobosenseRosWrapper)

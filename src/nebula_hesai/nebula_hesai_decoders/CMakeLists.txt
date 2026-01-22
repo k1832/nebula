@@ -33,6 +33,18 @@ if(BUILD_CUDA)
 
     # Optimization flags
     list(APPEND CUDA_NVCC_FLAGS "-O3")
+
+    # Check if CUDA kernel source exists
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/hesai_cuda_kernels.cu")
+      set(CUDA_KERNELS_EXIST TRUE)
+      message(STATUS "CUDA kernel source found, will build CUDA decoder")
+    else()
+      set(CUDA_KERNELS_EXIST FALSE)
+      message(WARNING "CUDA kernel source (src/cuda/hesai_cuda_kernels.cu) not found")
+      message(WARNING "Building without CUDA decoder support. To enable CUDA:")
+      message(WARNING "  1. Create the src/cuda/ directory")
+      message(WARNING "  2. Implement hesai_cuda_kernels.cu with CUDA kernels")
+    endif()
   endif()
 endif()
 
@@ -51,7 +63,7 @@ target_link_libraries(
          nebula_core_decoders::nebula_core_decoders rclcpp::rclcpp)
 
 # CUDA Decoder library
-if(BUILD_CUDA)
+if(BUILD_CUDA AND CUDA_KERNELS_EXIST)
   # Use modern CMake CUDA support
   enable_language(CUDA)
 

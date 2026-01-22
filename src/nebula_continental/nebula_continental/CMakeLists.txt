@@ -43,7 +43,7 @@ ament_target_dependencies(
   rclcpp_components)
 
 rclcpp_components_register_node(
-  continental_ars548_ros_wrapper PLUGIN "ContinentalARS548RosWrapper"
+  continental_ars548_ros_wrapper PLUGIN "nebula::ros::ContinentalARS548RosWrapper"
   EXECUTABLE continental_ars548_ros_wrapper_node)
 
 # SRR520
@@ -82,7 +82,7 @@ ament_target_dependencies(
   rclcpp_components)
 
 rclcpp_components_register_node(
-  continental_srr520_ros_wrapper PLUGIN "ContinentalSRR520RosWrapper"
+  continental_srr520_ros_wrapper PLUGIN "nebula::ros::ContinentalSRR520RosWrapper"
   EXECUTABLE continental_srr520_ros_wrapper_node)
 
 install(

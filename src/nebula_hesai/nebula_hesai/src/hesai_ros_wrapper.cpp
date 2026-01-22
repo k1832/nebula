@@ -682,5 +682,6 @@ HesaiRosWrapper::get_calibration_result_t HesaiRosWrapper::get_calibration_data(
   return calib;
 }
 
-RCLCPP_COMPONENTS_REGISTER_NODE(HesaiRosWrapper)
 }  // namespace nebula::ros
+
+RCLCPP_COMPONENTS_REGISTER_NODE(nebula::ros::HesaiRosWrapper)

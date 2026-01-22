@@ -24,7 +24,19 @@
 #include "nebula_hesai_decoders/decoders/packet_loss_detector.hpp"
 
 #ifdef NEBULA_CUDA_ENABLED
-#include "nebula_hesai_decoders/decoders/cuda/hesai_cuda_decoder.hpp"
+#include "nebula_hesai_decoders/cuda/hesai_cuda_decoder.hpp"
+
+// C-linkage kernel launcher declaration
+extern "C" void launch_decode_hesai_packet(
+  const uint16_t * d_distances,
+  const uint8_t * d_reflectivities,
+  const nebula::drivers::cuda::CudaAngleCorrectionData * d_angle_lut,
+  const nebula::drivers::cuda::CudaDecoderConfig * d_config,
+  nebula::drivers::cuda::CudaNebulaPoint * d_points,
+  uint32_t * d_count,
+  uint32_t n_azimuths,
+  uint32_t raw_azimuth,
+  cudaStream_t stream);
 #endif
 
 #include <nebula_core_common/loggers/logger.hpp>
@@ -207,13 +219,16 @@ private:
     cudaMemcpyAsync(d_config_, &config, sizeof(cuda::CudaDecoderConfig),
                     cudaMemcpyHostToDevice, cuda_stream_);
 
-    // Launch kernel (calls into the CUDA library)
-    cuda_decoder_->decode_packet(
-      reinterpret_cast<const uint8_t *>(&packet_),
-      sizeof(packet_),
-      config,
+    // Launch optimized CUDA kernel for point cloud decoding
+    launch_decode_hesai_packet(
+      d_distances_,
+      d_reflectivities_,
+      cuda_decoder_->get_angle_lut(),
+      d_config_,
       d_points_,
       d_count_,
+      cuda_n_azimuths_,
+      raw_azimuth,
       cuda_stream_);
 
     // Synchronize and copy results back
@@ -227,36 +242,92 @@ private:
       cudaMemcpy(cuda_point_buffer_.data(), d_points_,
                  point_count * sizeof(cuda::CudaNebulaPoint), cudaMemcpyDeviceToHost);
 
-      // Convert CUDA points to Nebula points and add to pointcloud
+      // Group points by channel for dual return filtering (following official Hesai SDK approach)
+      // Each channel can have up to n_blocks returns that need to be compared
+      std::vector<std::vector<uint32_t>> channel_point_indices(config.n_channels);
       for (uint32_t i = 0; i < point_count; ++i) {
         const auto & cuda_pt = cuda_point_buffer_[i];
+        if (cuda_pt.channel < config.n_channels) {
+          channel_point_indices[cuda_pt.channel].push_back(i);
+        }
+      }
 
-        // Check if point is in current scan or output scan based on azimuth
-        bool in_current_scan = true;
-        if (angle_corrector_.is_inside_overlap(last_azimuth_, raw_azimuth) &&
-            angle_is_between(
-              scan_cut_angles_.scan_emit_angle, scan_cut_angles_.scan_emit_angle + deg2rad(20),
-              cuda_pt.azimuth)) {
-          in_current_scan = false;
+      // Process each channel with dual return filtering
+      for (size_t channel_id = 0; channel_id < config.n_channels; ++channel_id) {
+        const auto & indices = channel_point_indices[channel_id];
+        if (indices.empty()) continue;
+
+        // Mark which points are valid after dual return filtering
+        std::vector<bool> point_valid(indices.size(), true);
+
+        // Apply dual return filtering rules (matching CPU logic exactly)
+        for (size_t idx = 0; idx < indices.size(); ++idx) {
+          if (!point_valid[idx]) continue;
+          const auto & pt = cuda_point_buffer_[indices[idx]];
+
+          // Rule: Keep only last of multiple points within dual_return_distance_threshold
+          // Only apply to non-last returns (block_offset != n_blocks - 1)
+          if (pt.return_type < n_blocks - 1) {  // Not the last return
+            bool should_filter = false;
+
+            // Compare with ALL other returns (not just later ones)
+            for (size_t other_idx = 0; other_idx < indices.size(); ++other_idx) {
+              if (other_idx == idx) continue;  // Skip self
+              const auto & other_pt = cuda_point_buffer_[indices[other_idx]];
+
+              // Check if distances are within threshold
+              float distance_diff = std::abs(other_pt.distance - pt.distance);
+              if (distance_diff < config.dual_return_distance_threshold) {
+                should_filter = true;
+                break;
+              }
+            }
+
+            if (should_filter) {
+              point_valid[idx] = false;
+            }
+          }
         }
 
-        auto & frame = in_current_scan ? decode_frame_ : output_frame_;
+        // Add valid points to pointcloud
+        for (size_t idx = 0; idx < indices.size(); ++idx) {
+          if (!point_valid[idx]) continue;
 
-        NebulaPoint point;
-        point.x = cuda_pt.x;
-        point.y = cuda_pt.y;
-        point.z = cuda_pt.z;
-        point.distance = cuda_pt.distance;
-        point.azimuth = cuda_pt.azimuth;
-        point.elevation = cuda_pt.elevation;
-        point.intensity = cuda_pt.intensity;
-        point.return_type = cuda_pt.return_type;
-        point.channel = cuda_pt.channel;
-        point.time_stamp = get_point_time_relative(
-          frame.scan_timestamp_ns, packet_timestamp_ns, start_block_id, cuda_pt.channel);
+          const auto & cuda_pt = cuda_point_buffer_[indices[idx]];
 
-        if (!mask_filter_ || !mask_filter_->excluded(point)) {
-          frame.pointcloud->emplace_back(point);
+          // FOV filtering (matching CPU logic) - filter points outside the configured FOV
+          bool in_fov = angle_is_between(scan_cut_angles_.fov_min, scan_cut_angles_.fov_max, cuda_pt.azimuth);
+          if (!in_fov) {
+            continue;
+          }
+
+          // Check if point is in current scan or output scan based on azimuth
+          bool in_current_scan = true;
+          if (angle_corrector_.is_inside_overlap(last_azimuth_, raw_azimuth) &&
+              angle_is_between(
+                scan_cut_angles_.scan_emit_angle, scan_cut_angles_.scan_emit_angle + deg2rad(20),
+                cuda_pt.azimuth)) {
+            in_current_scan = false;
+          }
+
+          auto & frame = in_current_scan ? decode_frame_ : output_frame_;
+
+          NebulaPoint point;
+          point.x = cuda_pt.x;
+          point.y = cuda_pt.y;
+          point.z = cuda_pt.z;
+          point.distance = cuda_pt.distance;
+          point.azimuth = cuda_pt.azimuth;
+          point.elevation = cuda_pt.elevation;
+          point.intensity = cuda_pt.intensity;
+          point.return_type = cuda_pt.return_type;
+          point.channel = cuda_pt.channel;
+          point.time_stamp = get_point_time_relative(
+            frame.scan_timestamp_ns, packet_timestamp_ns, start_block_id, cuda_pt.channel);
+
+          if (!mask_filter_ || !mask_filter_->excluded(point)) {
+            frame.pointcloud->emplace_back(point);
+          }
         }
       }
     }
@@ -494,6 +565,15 @@ public:
   /// @brief Initialize CUDA decoder and upload angle corrections
   void initialize_cuda()
   {
+    // CUDA acceleration is only supported for calibration-based sensors (fixed angle tables)
+    // Correction-based sensors (like AT128) have complex angle corrections that would require
+    // enormous LUTs (360 * degree_subdivisions * n_channels entries), making CUDA impractical
+    if constexpr (!SensorT::uses_calibration_based_angles) {
+      NEBULA_LOG_STREAM(logger_->info,
+        "CUDA decoding not supported for correction-based sensors, using CPU decoding");
+      return;
+    }
+
     // Create CUDA stream
     cudaError_t err = cudaStreamCreate(&cuda_stream_);
     if (err != cudaSuccess) {
@@ -734,11 +814,7 @@ public:
       }
 
 #ifdef NEBULA_CUDA_ENABLED
-      if (cuda_enabled_) {
-        convert_returns_cuda(block_id, n_returns);
-      } else {
-        convert_returns(block_id, n_returns);
-      }
+      convert_returns_cuda(block_id, n_returns);
 #else
       convert_returns(block_id, n_returns);
 #endif

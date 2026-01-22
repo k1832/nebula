@@ -94,6 +94,11 @@ public:
     AngleCorrectorCalibrationBased<PacketT::n_channels, PacketT::degree_subdivisions>,
     AngleCorrectorCorrectionBased<PacketT::n_channels, PacketT::degree_subdivisions>>::type;
 
+  /// @brief Whether this sensor uses calibration-based angle correction (simple fixed angles)
+  /// CUDA acceleration is only supported for calibration-based sensors due to LUT size constraints
+  static constexpr bool uses_calibration_based_angles =
+    (AngleCorrection == AngleCorrectionType::CALIBRATION);
+
   HesaiSensor() = default;
   virtual ~HesaiSensor() = default;
 

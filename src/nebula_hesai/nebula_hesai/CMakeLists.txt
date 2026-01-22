@@ -50,7 +50,7 @@ if("$ENV{ENABLE_AGNOCAST}")
   add_definitions(-DUSE_AGNOCAST_ENABLED)
 endif()
 
-rclcpp_components_register_node(hesai_ros_wrapper PLUGIN "HesaiRosWrapper"
+rclcpp_components_register_node(hesai_ros_wrapper PLUGIN "nebula::ros::HesaiRosWrapper"
                                 EXECUTABLE hesai_ros_wrapper_node)
 
 install(
