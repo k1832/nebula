@@ -46,9 +46,10 @@ __global__ void decode_hesai_packet_kernel(
     return;
   }
 
-  // Calculate linear index: channel_id * n_blocks + block_id
-  // This layout ensures coalesced reads when threads in a warp process consecutive channels
-  const uint32_t data_idx = channel_id * config.n_blocks + block_id;
+  // Calculate linear index using data_stride for input buffer access
+  // data_stride may differ from n_blocks in batched mode (staging buffer uses max_returns stride)
+  const uint32_t data_stride = config.data_stride > 0 ? config.data_stride : config.n_blocks;
+  const uint32_t data_idx = channel_id * data_stride + block_id;
 
   // Load distance and reflectivity with coalesced access
   const uint16_t raw_distance = distances[data_idx];
@@ -107,6 +108,90 @@ __global__ void decode_hesai_packet_kernel(
   out_pt.intensity = static_cast<float>(reflectivity);
   out_pt.return_type = static_cast<uint8_t>(block_id);  // block_id represents return index
   out_pt.channel = static_cast<uint16_t>(channel_id);
+  out_pt.entry_id = config.entry_id;  // Used for batched mode post-processing
+}
+
+/// @brief Batched kernel for processing multiple packets in one launch
+/// Processes an entire scan (typically ~3,240 packets) in a single kernel call
+__global__ void decode_hesai_scan_batch_kernel(
+  const uint16_t * __restrict__ d_distances_ring,
+  const uint8_t * __restrict__ d_reflectivities_ring,
+  const uint32_t * __restrict__ d_raw_azimuths,
+  const uint32_t * __restrict__ d_n_returns,
+  const CudaAngleCorrectionData * __restrict__ angle_lut,
+  const CudaDecoderConfig config,
+  CudaNebulaPoint * __restrict__ output_points,
+  uint32_t * __restrict__ output_count,
+  uint32_t n_azimuths,
+  uint32_t n_packets)
+{
+  // Global thread ID across all blocks
+  const uint32_t global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+  // Total work: n_packets * n_channels * max_returns
+  const uint32_t total_work = n_packets * config.n_channels * config.max_returns;
+  if (global_tid >= total_work) return;
+
+  // Decompose thread ID into (packet_id, channel_id, return_id)
+  const uint32_t packet_id = global_tid / (config.n_channels * config.max_returns);
+  const uint32_t channel_id = (global_tid / config.max_returns) % config.n_channels;
+  const uint32_t return_id = global_tid % config.max_returns;
+
+  // Bounds check for variable return modes (e.g., single/dual/triple return)
+  if (return_id >= d_n_returns[packet_id]) return;
+
+  // Calculate buffer index: packet_id * stride + channel_id * max_returns + return_id
+  const uint32_t data_idx = packet_id * (config.n_channels * config.max_returns)
+                           + channel_id * config.max_returns + return_id;
+
+  // Load distance and reflectivity
+  const uint16_t raw_distance = d_distances_ring[data_idx];
+  const uint8_t reflectivity = d_reflectivities_ring[data_idx];
+
+  // Early exit for invalid points
+  if (raw_distance == 0) return;
+
+  // Convert distance using unit scale
+  const float distance = static_cast<float>(raw_distance) * config.dis_unit;
+
+  // Range filtering
+  if (distance < config.min_range || distance > config.max_range) return;
+  if (distance < config.sensor_min_range || distance > config.sensor_max_range) return;
+
+  // Get raw azimuth for this packet
+  const uint32_t raw_azimuth = d_raw_azimuths[packet_id];
+
+  // Calculate azimuth index for lookup table
+  const uint32_t azimuth_idx = raw_azimuth % n_azimuths;
+
+  // Lookup angle corrections
+  const uint32_t lut_idx = azimuth_idx * config.n_channels + channel_id;
+  const CudaAngleCorrectionData angle_data = angle_lut[lut_idx];
+
+  // Compute Cartesian coordinates
+  const float xy_distance = distance * angle_data.cos_elevation;
+  const float x = xy_distance * angle_data.sin_azimuth;
+  const float y = xy_distance * angle_data.cos_azimuth;
+  const float z = distance * angle_data.sin_elevation;
+
+  // Atomic increment to get unique output index
+  const uint32_t output_idx = atomicAdd(output_count, 1);
+
+  // Bounds check for output buffer
+  if (output_idx >= 262144) return;  // Typical max_scan_buffer_points
+
+  // Write output point
+  CudaNebulaPoint & out_pt = output_points[output_idx];
+  out_pt.x = x;
+  out_pt.y = y;
+  out_pt.z = z;
+  out_pt.distance = distance;
+  out_pt.azimuth = angle_data.azimuth_rad;
+  out_pt.elevation = angle_data.elevation_rad;
+  out_pt.intensity = static_cast<float>(reflectivity);
+  out_pt.return_type = static_cast<uint8_t>(return_id);
+  out_pt.channel = static_cast<uint16_t>(channel_id);
+  out_pt.entry_id = packet_id;  // Store block group ID for batched processing
 }
 
 // Constructor
@@ -205,8 +290,8 @@ extern "C" void launch_decode_hesai_packet(
   uint32_t raw_azimuth,
   cudaStream_t stream)
 {
-  // Zero out the output count asynchronously
-  cudaMemsetAsync(d_count, 0, sizeof(uint32_t), stream);
+  // NOTE: d_count is NOT reset here - caller is responsible for resetting it
+  // For batched mode, the caller resets once at the start, then accumulates across entries
 
   // Copy config from device to host to get parameters
   // This is necessary because we need config values for kernel launch
@@ -239,5 +324,54 @@ extern "C" void launch_decode_hesai_packet(
   cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess) {
     fprintf(stderr, "CUDA kernel launch failed: %s\n", cudaGetErrorString(err));
+  }
+}
+
+// C-linkage wrapper for launching batched kernel (processes entire scan in one launch)
+extern "C" void launch_decode_hesai_scan_batch(
+  const uint16_t * d_distances_ring,
+  const uint8_t * d_reflectivities_ring,
+  const uint32_t * d_raw_azimuths,
+  const uint32_t * d_n_returns,
+  const nebula::drivers::cuda::CudaAngleCorrectionData * d_angle_lut,
+  const nebula::drivers::cuda::CudaDecoderConfig * d_config,
+  nebula::drivers::cuda::CudaNebulaPoint * d_points,
+  uint32_t * d_count,
+  uint32_t n_azimuths,
+  uint32_t n_packets,
+  cudaStream_t stream)
+{
+  // Copy config to get parameters
+  nebula::drivers::cuda::CudaDecoderConfig config;
+  cudaMemcpyAsync(&config, d_config, sizeof(nebula::drivers::cuda::CudaDecoderConfig),
+                  cudaMemcpyDeviceToHost, stream);
+  cudaStreamSynchronize(stream);  // Ensure config is available
+
+  // Calculate grid dimensions for batched processing
+  // Total work: n_packets * n_channels * max_returns
+  const uint32_t total_work = n_packets * config.n_channels * config.max_returns;
+  const uint32_t threads_per_block = 256;  // Larger block size for better occupancy
+  const uint32_t n_blocks = (total_work + threads_per_block - 1) / threads_per_block;
+
+  dim3 grid(n_blocks);
+  dim3 block(threads_per_block);
+
+  // Launch batched kernel - processes entire scan in one call
+  nebula::drivers::cuda::decode_hesai_scan_batch_kernel<<<grid, block, 0, stream>>>(
+    d_distances_ring,
+    d_reflectivities_ring,
+    d_raw_azimuths,
+    d_n_returns,
+    d_angle_lut,
+    config,
+    d_points,
+    d_count,
+    n_azimuths,
+    n_packets);
+
+  // Check for kernel launch errors
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    fprintf(stderr, "CUDA batched kernel launch failed: %s\n", cudaGetErrorString(err));
   }
 }

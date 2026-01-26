@@ -33,6 +33,8 @@ struct CudaNebulaPoint
   float intensity;
   uint8_t return_type;
   uint16_t channel;
+  uint8_t padding;       // Padding for alignment
+  uint32_t entry_id;     // Block group ID for batched processing (used for sorting & filtering)
 };
 
 /// @brief Angle correction data for CUDA lookup table
@@ -61,6 +63,8 @@ struct CudaDecoderConfig
   uint32_t n_blocks;
   uint32_t max_returns;
   float dis_unit;
+  uint32_t data_stride;  // Stride between channels in input data (for batched mode)
+  uint32_t entry_id;     // Entry ID for batched mode (0 in per-packet mode)
 };
 
 /// @brief Main CUDA decoder class for Hesai LiDAR
