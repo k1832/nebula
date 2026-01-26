@@ -261,17 +261,18 @@ private:
     gpu_scan_buffer_.packet_count++;
   }
 
-  /// @brief Flush accumulated packets - process each entry immediately after kernel (matches non-batched exactly)
+  /// @brief Flush accumulated packets - TRUE BATCHING: one kernel launch for entire scan
+  /// This eliminates the ~30us overhead per entry that was killing performance
   void flush_gpu_scan_buffer()
   {
     if (gpu_scan_buffer_.packet_count == 0) return;
 
-    uint32_t n_entries = gpu_scan_buffer_.packet_count;
+    const uint32_t n_entries = gpu_scan_buffer_.packet_count;
     const size_t n_channels = SensorT::packet_t::n_channels;
     const size_t max_returns = SensorT::packet_t::max_returns;
-    const size_t entry_data_size = n_channels * max_returns;
+    const size_t total_data_size = n_entries * n_channels * max_returns;
 
-    // Prepare config (same for all entries except n_blocks/entry_id)
+    // Prepare config for batched kernel
     cuda::CudaDecoderConfig config;
     config.min_range = sensor_configuration_->min_range;
     config.max_range = sensor_configuration_->max_range;
@@ -282,132 +283,154 @@ private:
     config.fov_max_rad = scan_cut_angles_.fov_max;
     config.scan_emit_angle_rad = scan_cut_angles_.scan_emit_angle;
     config.n_channels = n_channels;
+    config.max_returns = max_returns;
     config.dis_unit = hesai_packet::get_dis_unit(packet_);
     config.data_stride = max_returns;
+    config.n_blocks = max_returns;  // Used by batched kernel for work calculation
+    config.entry_id = 0;  // Not used in batched mode
 
-    // Process each entry independently, exactly like non-batched mode
-    // This ensures identical point ordering by processing each entry's points immediately
+    // === STEP 1: Bulk copy ALL data to GPU (ONE transfer per buffer) ===
+    cudaMemcpyAsync(gpu_scan_buffer_.d_distances_ring, gpu_scan_buffer_.h_distances_staging,
+                    total_data_size * sizeof(uint16_t),
+                    cudaMemcpyHostToDevice, cuda_stream_);
+    cudaMemcpyAsync(gpu_scan_buffer_.d_reflectivities_ring, gpu_scan_buffer_.h_reflectivities_staging,
+                    total_data_size * sizeof(uint8_t),
+                    cudaMemcpyHostToDevice, cuda_stream_);
+    cudaMemcpyAsync(gpu_scan_buffer_.d_raw_azimuths, gpu_scan_buffer_.h_raw_azimuths_staging,
+                    n_entries * sizeof(uint32_t),
+                    cudaMemcpyHostToDevice, cuda_stream_);
+    cudaMemcpyAsync(gpu_scan_buffer_.d_n_returns, gpu_scan_buffer_.h_n_returns_staging,
+                    n_entries * sizeof(uint32_t),
+                    cudaMemcpyHostToDevice, cuda_stream_);
+    cudaMemcpyAsync(d_config_, &config, sizeof(config),
+                    cudaMemcpyHostToDevice, cuda_stream_);
+
+    // === STEP 2: Reset output counter ONCE ===
+    cudaMemsetAsync(d_count_, 0, sizeof(uint32_t), cuda_stream_);
+
+    // === STEP 3: Launch ONE batched kernel for entire scan ===
+    launch_decode_hesai_scan_batch(
+      gpu_scan_buffer_.d_distances_ring,
+      gpu_scan_buffer_.d_reflectivities_ring,
+      gpu_scan_buffer_.d_raw_azimuths,
+      gpu_scan_buffer_.d_n_returns,
+      cuda_decoder_->get_angle_lut(),
+      d_config_,
+      d_points_,
+      d_count_,
+      cuda_n_azimuths_,
+      n_entries,
+      cuda_stream_);
+
+    // === STEP 4: Synchronize ONCE ===
+    cudaStreamSynchronize(cuda_stream_);
+
+    // === STEP 5: Copy ALL results back at once ===
+    uint32_t total_point_count = 0;
+    cudaMemcpy(&total_point_count, d_count_, sizeof(uint32_t), cudaMemcpyDeviceToHost);
+
+    if (total_point_count == 0) {
+      gpu_scan_buffer_.packet_count = 0;
+      return;
+    }
+
+    total_point_count = std::min(total_point_count, static_cast<uint32_t>(cuda_point_buffer_.size()));
+    cudaMemcpy(cuda_point_buffer_.data(), d_points_,
+               total_point_count * sizeof(cuda::CudaNebulaPoint),
+               cudaMemcpyDeviceToHost);
+
+    // === STEP 6: CPU post-processing grouped by entry_id ===
+    // Group points by entry_id (packet_id stored by batched kernel)
+    std::vector<std::vector<uint32_t>> entry_point_indices(n_entries);
+    for (uint32_t i = 0; i < total_point_count; ++i) {
+      uint32_t entry_id = cuda_point_buffer_[i].entry_id;
+      if (entry_id < n_entries) {
+        entry_point_indices[entry_id].push_back(i);
+      }
+    }
+
+    // Get packet timestamp for point time calculation
+    uint64_t packet_timestamp_ns = hesai_packet::get_timestamp_ns(packet_);
+
+    // Process each entry's points with dual-return filtering, FOV filtering, scan assignment
     for (uint32_t entry_id = 0; entry_id < n_entries; ++entry_id) {
-      const size_t entry_offset = entry_id * entry_data_size;
+      const auto & point_indices = entry_point_indices[entry_id];
+      if (point_indices.empty()) continue;
+
       const uint32_t n_blocks = gpu_scan_buffer_.h_n_returns_staging[entry_id];
       const uint32_t raw_azimuth = gpu_scan_buffer_.h_raw_azimuths_staging[entry_id];
       const uint32_t entry_last_azimuth = gpu_scan_buffer_.h_last_azimuths_staging[entry_id];
 
-      config.n_blocks = n_blocks;
-      config.max_returns = n_blocks;
-      config.entry_id = 0;  // Reset for each entry (like non-batched)
-
-      // Reset output counter for each entry (exactly like non-batched)
-      cudaMemsetAsync(d_count_, 0, sizeof(uint32_t), cuda_stream_);
-
-      // Copy entry data to device
-      cudaMemcpyAsync(d_distances_, &gpu_scan_buffer_.h_distances_staging[entry_offset],
-                      entry_data_size * sizeof(uint16_t),
-                      cudaMemcpyHostToDevice, cuda_stream_);
-      cudaMemcpyAsync(d_reflectivities_, &gpu_scan_buffer_.h_reflectivities_staging[entry_offset],
-                      entry_data_size * sizeof(uint8_t),
-                      cudaMemcpyHostToDevice, cuda_stream_);
-      cudaMemcpyAsync(d_config_, &config, sizeof(config),
-                      cudaMemcpyHostToDevice, cuda_stream_);
-
-      // Launch kernel
-      launch_decode_hesai_packet(
-        d_distances_,
-        d_reflectivities_,
-        cuda_decoder_->get_angle_lut(),
-        d_config_,
-        d_points_,
-        d_count_,
-        cuda_n_azimuths_,
-        raw_azimuth,
-        cuda_stream_);
-
-      cudaStreamSynchronize(cuda_stream_);
-
-      // Copy results back for this entry
-      uint32_t point_count = 0;
-      cudaMemcpy(&point_count, d_count_, sizeof(uint32_t), cudaMemcpyDeviceToHost);
-
-      if (point_count > 0) {
-        point_count = std::min(point_count, static_cast<uint32_t>(cuda_point_buffer_.size()));
-        cudaMemcpy(cuda_point_buffer_.data(), d_points_,
-                   point_count * sizeof(cuda::CudaNebulaPoint),
-                   cudaMemcpyDeviceToHost);
-
-        // Get packet timestamp for point time calculation
-        uint64_t packet_timestamp_ns = hesai_packet::get_timestamp_ns(packet_);
-
-        // Group points by channel for dual return filtering (exactly like non-batched)
-        std::vector<std::vector<uint32_t>> channel_point_indices(n_channels);
-        for (uint32_t i = 0; i < point_count; ++i) {
-          const auto & cuda_pt = cuda_point_buffer_[i];
-          if (cuda_pt.channel < n_channels) {
-            channel_point_indices[cuda_pt.channel].push_back(i);
-          }
+      // Group points by channel for dual-return filtering
+      std::vector<std::vector<uint32_t>> channel_point_indices(n_channels);
+      for (uint32_t pt_idx : point_indices) {
+        const auto & cuda_pt = cuda_point_buffer_[pt_idx];
+        if (cuda_pt.channel < n_channels) {
+          channel_point_indices[cuda_pt.channel].push_back(pt_idx);
         }
+      }
 
-        // Process each channel with dual return filtering (exactly like non-batched)
-        for (size_t channel_id = 0; channel_id < n_channels; ++channel_id) {
-          const auto & indices = channel_point_indices[channel_id];
-          if (indices.empty()) continue;
+      // Process each channel with dual-return filtering
+      for (size_t channel_id = 0; channel_id < n_channels; ++channel_id) {
+        const auto & indices = channel_point_indices[channel_id];
+        if (indices.empty()) continue;
 
-          std::vector<bool> point_valid(indices.size(), true);
+        std::vector<bool> point_valid(indices.size(), true);
 
-          // Apply dual return filtering
-          for (size_t idx = 0; idx < indices.size(); ++idx) {
-            if (!point_valid[idx]) continue;
-            const auto & pt = cuda_point_buffer_[indices[idx]];
+        // Apply dual-return filtering
+        for (size_t idx = 0; idx < indices.size(); ++idx) {
+          if (!point_valid[idx]) continue;
+          const auto & pt = cuda_point_buffer_[indices[idx]];
 
-            if (pt.return_type < n_blocks - 1) {
-              for (size_t other_idx = 0; other_idx < indices.size(); ++other_idx) {
-                if (other_idx == idx) continue;
-                const auto & other_pt = cuda_point_buffer_[indices[other_idx]];
-                float distance_diff = std::abs(other_pt.distance - pt.distance);
-                if (distance_diff < config.dual_return_distance_threshold) {
-                  point_valid[idx] = false;
-                  break;
-                }
+          if (pt.return_type < n_blocks - 1) {
+            for (size_t other_idx = 0; other_idx < indices.size(); ++other_idx) {
+              if (other_idx == idx) continue;
+              const auto & other_pt = cuda_point_buffer_[indices[other_idx]];
+              float distance_diff = std::abs(other_pt.distance - pt.distance);
+              if (distance_diff < config.dual_return_distance_threshold) {
+                point_valid[idx] = false;
+                break;
               }
             }
           }
+        }
 
-          // Add valid points to pointcloud
-          for (size_t idx = 0; idx < indices.size(); ++idx) {
-            if (!point_valid[idx]) continue;
+        // Add valid points to pointcloud
+        for (size_t idx = 0; idx < indices.size(); ++idx) {
+          if (!point_valid[idx]) continue;
 
-            const auto & cuda_pt = cuda_point_buffer_[indices[idx]];
+          const auto & cuda_pt = cuda_point_buffer_[indices[idx]];
 
-            // FOV filtering
-            bool in_fov = angle_is_between(scan_cut_angles_.fov_min, scan_cut_angles_.fov_max, cuda_pt.azimuth);
-            if (!in_fov) continue;
+          // FOV filtering
+          bool in_fov = angle_is_between(scan_cut_angles_.fov_min, scan_cut_angles_.fov_max, cuda_pt.azimuth);
+          if (!in_fov) continue;
 
-            // Overlap check using per-entry last_azimuth
-            bool in_current_scan = true;
-            if (angle_corrector_.is_inside_overlap(entry_last_azimuth, raw_azimuth) &&
-                angle_is_between(scan_cut_angles_.scan_emit_angle,
-                                scan_cut_angles_.scan_emit_angle + deg2rad(20),
-                                cuda_pt.azimuth)) {
-              in_current_scan = false;
-            }
+          // Overlap check using per-entry last_azimuth
+          bool in_current_scan = true;
+          if (angle_corrector_.is_inside_overlap(entry_last_azimuth, raw_azimuth) &&
+              angle_is_between(scan_cut_angles_.scan_emit_angle,
+                              scan_cut_angles_.scan_emit_angle + deg2rad(20),
+                              cuda_pt.azimuth)) {
+            in_current_scan = false;
+          }
 
-            auto & frame = in_current_scan ? decode_frame_ : output_frame_;
+          auto & frame = in_current_scan ? decode_frame_ : output_frame_;
 
-            NebulaPoint point;
-            point.x = cuda_pt.x;
-            point.y = cuda_pt.y;
-            point.z = cuda_pt.z;
-            point.distance = cuda_pt.distance;
-            point.azimuth = cuda_pt.azimuth;
-            point.elevation = cuda_pt.elevation;
-            point.intensity = cuda_pt.intensity;
-            point.return_type = cuda_pt.return_type;
-            point.channel = cuda_pt.channel;
-            point.time_stamp = get_point_time_relative(
-              frame.scan_timestamp_ns, packet_timestamp_ns, 0, cuda_pt.channel);
+          NebulaPoint point;
+          point.x = cuda_pt.x;
+          point.y = cuda_pt.y;
+          point.z = cuda_pt.z;
+          point.distance = cuda_pt.distance;
+          point.azimuth = cuda_pt.azimuth;
+          point.elevation = cuda_pt.elevation;
+          point.intensity = cuda_pt.intensity;
+          point.return_type = cuda_pt.return_type;
+          point.channel = cuda_pt.channel;
+          point.time_stamp = get_point_time_relative(
+            frame.scan_timestamp_ns, packet_timestamp_ns, 0, cuda_pt.channel);
 
-            if (!mask_filter_ || !mask_filter_->excluded(point)) {
-              frame.pointcloud->emplace_back(point);
-            }
+          if (!mask_filter_ || !mask_filter_->excluded(point)) {
+            frame.pointcloud->emplace_back(point);
           }
         }
       }
