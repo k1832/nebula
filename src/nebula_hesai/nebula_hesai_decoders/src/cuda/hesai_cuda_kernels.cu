@@ -21,6 +21,44 @@
 namespace nebula::drivers::cuda
 {
 
+// Device function: Check if angle is between start and end (handles wrap-around)
+// Works with both radians and raw azimuth units
+__device__ __forceinline__ bool cuda_angle_is_between(float start, float end, float angle)
+{
+  // Handle wrap-around case: end < start means range crosses 0/2pi boundary
+  if (start <= end) {
+    return (start <= angle && angle <= end);
+  } else {
+    return (angle <= end || start <= angle);
+  }
+}
+
+// Device function: Check if angle is between start and end (uint32 version for raw azimuths)
+__device__ __forceinline__ bool cuda_angle_is_between_raw(
+  uint32_t start, uint32_t end, uint32_t angle, uint32_t max_angle)
+{
+  // Normalize angles to [0, max_angle)
+  start = start % max_angle;
+  end = end % max_angle;
+  angle = angle % max_angle;
+
+  if (start <= end) {
+    return (start <= angle && angle <= end);
+  } else {
+    return (angle <= end || start <= angle);
+  }
+}
+
+// Device function: Check if we're inside the overlap region
+// Overlap is the region between timestamp_reset_angle and emit_angle
+__device__ __forceinline__ bool cuda_is_inside_overlap(
+  uint32_t last_azimuth, uint32_t current_azimuth,
+  uint32_t timestamp_reset_angle, uint32_t emit_angle, uint32_t max_angle)
+{
+  return cuda_angle_is_between_raw(timestamp_reset_angle, emit_angle, current_azimuth, max_angle) ||
+         cuda_angle_is_between_raw(timestamp_reset_angle, emit_angle, last_azimuth, max_angle);
+}
+
 // CUDA kernel for decoding Hesai LiDAR points
 // Highly optimized for:
 // - Coalesced memory access patterns
@@ -113,11 +151,13 @@ __global__ void decode_hesai_packet_kernel(
 
 /// @brief Batched kernel for processing multiple packets in one launch
 /// Processes an entire scan (typically ~3,240 packets) in a single kernel call
+/// Includes FOV filtering and overlap/scan assignment on GPU
 __global__ void decode_hesai_scan_batch_kernel(
   const uint16_t * __restrict__ d_distances_ring,
   const uint8_t * __restrict__ d_reflectivities_ring,
   const uint32_t * __restrict__ d_raw_azimuths,
   const uint32_t * __restrict__ d_n_returns,
+  const uint32_t * __restrict__ d_last_azimuths,  // Per-entry last_azimuth for overlap check
   const CudaAngleCorrectionData * __restrict__ angle_lut,
   const CudaDecoderConfig config,
   CudaNebulaPoint * __restrict__ output_points,
@@ -168,6 +208,36 @@ __global__ void decode_hesai_scan_batch_kernel(
   const uint32_t lut_idx = azimuth_idx * config.n_channels + channel_id;
   const CudaAngleCorrectionData angle_data = angle_lut[lut_idx];
 
+  // === FOV FILTERING (GPU) ===
+  // Check if azimuth is within configured field of view
+  const bool in_fov = cuda_angle_is_between(config.fov_min_rad, config.fov_max_rad,
+                                            angle_data.azimuth_rad);
+  if (!in_fov) return;
+
+  // === OVERLAP/SCAN ASSIGNMENT (GPU) ===
+  // Determine if this point belongs to current scan or output/next scan
+  const uint32_t last_azimuth = d_last_azimuths[packet_id];
+  uint8_t in_current_scan = 1;  // Default: belongs to current scan
+
+  // Check if we're in the overlap region
+  if (cuda_is_inside_overlap(last_azimuth, raw_azimuth,
+                             config.timestamp_reset_angle_raw, config.emit_angle_raw,
+                             config.n_azimuths_raw)) {
+    // In overlap region, check if azimuth is between emit_angle and emit_angle + 20 degrees
+    // 20 degrees in radians = 20 * pi / 180 = 0.349066
+    constexpr float overlap_margin_rad = 0.349066f;
+    const float overlap_end = config.scan_emit_angle_rad + overlap_margin_rad;
+    if (cuda_angle_is_between(config.scan_emit_angle_rad, overlap_end, angle_data.azimuth_rad)) {
+      in_current_scan = 0;  // Belongs to output/next scan
+    }
+  }
+
+  // NOTE: Dual-return filtering remains on CPU because it requires:
+  // 1. IDENTICAL return type detection via sensor_.get_return_type() (sensor-specific)
+  // 2. Distance threshold comparison with proper handling of return types
+  // GPU handles: range filtering, FOV filtering, overlap/scan assignment
+  // CPU handles: dual-return filtering, mask filtering
+
   // Compute Cartesian coordinates
   const float xy_distance = distance * angle_data.cos_elevation;
   const float x = xy_distance * angle_data.sin_azimuth;
@@ -191,6 +261,7 @@ __global__ void decode_hesai_scan_batch_kernel(
   out_pt.intensity = static_cast<float>(reflectivity);
   out_pt.return_type = static_cast<uint8_t>(return_id);
   out_pt.channel = static_cast<uint16_t>(channel_id);
+  out_pt.in_current_scan = in_current_scan;
   out_pt.entry_id = packet_id;  // Store block group ID for batched processing
 }
 
@@ -333,6 +404,7 @@ extern "C" void launch_decode_hesai_scan_batch(
   const uint8_t * d_reflectivities_ring,
   const uint32_t * d_raw_azimuths,
   const uint32_t * d_n_returns,
+  const uint32_t * d_last_azimuths,  // Per-entry last_azimuth for overlap check
   const nebula::drivers::cuda::CudaAngleCorrectionData * d_angle_lut,
   const nebula::drivers::cuda::CudaDecoderConfig * d_config,
   nebula::drivers::cuda::CudaNebulaPoint * d_points,
@@ -357,11 +429,13 @@ extern "C" void launch_decode_hesai_scan_batch(
   dim3 block(threads_per_block);
 
   // Launch batched kernel - processes entire scan in one call
+  // Now includes FOV filtering and overlap/scan assignment on GPU
   nebula::drivers::cuda::decode_hesai_scan_batch_kernel<<<grid, block, 0, stream>>>(
     d_distances_ring,
     d_reflectivities_ring,
     d_raw_azimuths,
     d_n_returns,
+    d_last_azimuths,
     d_angle_lut,
     config,
     d_points,

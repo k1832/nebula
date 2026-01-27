@@ -39,11 +39,13 @@ extern "C" void launch_decode_hesai_packet(
   cudaStream_t stream);
 
 // C-linkage batched kernel launcher declaration (processes entire scan)
+// Includes GPU FOV filtering and overlap/scan assignment
 extern "C" void launch_decode_hesai_scan_batch(
   const uint16_t * d_distances_ring,
   const uint8_t * d_reflectivities_ring,
   const uint32_t * d_raw_azimuths,
   const uint32_t * d_n_returns,
+  const uint32_t * d_last_azimuths,  // Per-entry last_azimuth for GPU overlap check
   const nebula::drivers::cuda::CudaAngleCorrectionData * d_angle_lut,
   const nebula::drivers::cuda::CudaDecoderConfig * d_config,
   nebula::drivers::cuda::CudaNebulaPoint * d_points,
@@ -168,6 +170,7 @@ private:
     uint8_t* d_reflectivities_ring = nullptr;  // [MAX_PACKETS][n_channels * max_returns]
     uint32_t* d_raw_azimuths = nullptr;        // [MAX_PACKETS]
     uint32_t* d_n_returns = nullptr;           // [MAX_PACKETS]
+    uint32_t* d_last_azimuths = nullptr;       // [MAX_PACKETS] Per-entry last_azimuth for GPU overlap check
 
     // Pinned host memory for fast staging
     uint16_t* h_distances_staging = nullptr;
@@ -272,7 +275,7 @@ private:
     const size_t max_returns = SensorT::packet_t::max_returns;
     const size_t total_data_size = n_entries * n_channels * max_returns;
 
-    // Prepare config for batched kernel
+    // Prepare config for batched kernel (includes GPU FOV filtering and overlap check params)
     cuda::CudaDecoderConfig config;
     config.min_range = sensor_configuration_->min_range;
     config.max_range = sensor_configuration_->max_range;
@@ -288,6 +291,13 @@ private:
     config.data_stride = max_returns;
     config.n_blocks = max_returns;  // Used by batched kernel for work calculation
     config.entry_id = 0;  // Not used in batched mode
+    // Overlap detection parameters for GPU kernel (raw azimuth in 0.01 degree units)
+    // Only calibration-based sensors have these members (and CUDA is only supported for them)
+    if constexpr (SensorT::uses_calibration_based_angles) {
+      config.timestamp_reset_angle_raw = angle_corrector_.timestamp_reset_angle_raw_;
+      config.emit_angle_raw = angle_corrector_.emit_angle_raw_;
+    }
+    config.n_azimuths_raw = cuda_n_azimuths_;
 
     // === STEP 1: Bulk copy ALL data to GPU (ONE transfer per buffer) ===
     cudaMemcpyAsync(gpu_scan_buffer_.d_distances_ring, gpu_scan_buffer_.h_distances_staging,
@@ -302,6 +312,9 @@ private:
     cudaMemcpyAsync(gpu_scan_buffer_.d_n_returns, gpu_scan_buffer_.h_n_returns_staging,
                     n_entries * sizeof(uint32_t),
                     cudaMemcpyHostToDevice, cuda_stream_);
+    cudaMemcpyAsync(gpu_scan_buffer_.d_last_azimuths, gpu_scan_buffer_.h_last_azimuths_staging,
+                    n_entries * sizeof(uint32_t),
+                    cudaMemcpyHostToDevice, cuda_stream_);
     cudaMemcpyAsync(d_config_, &config, sizeof(config),
                     cudaMemcpyHostToDevice, cuda_stream_);
 
@@ -309,11 +322,13 @@ private:
     cudaMemsetAsync(d_count_, 0, sizeof(uint32_t), cuda_stream_);
 
     // === STEP 3: Launch ONE batched kernel for entire scan ===
+    // Kernel now includes GPU FOV filtering and overlap/scan assignment
     launch_decode_hesai_scan_batch(
       gpu_scan_buffer_.d_distances_ring,
       gpu_scan_buffer_.d_reflectivities_ring,
       gpu_scan_buffer_.d_raw_azimuths,
       gpu_scan_buffer_.d_n_returns,
+      gpu_scan_buffer_.d_last_azimuths,  // Per-entry last_azimuth for GPU overlap check
       cuda_decoder_->get_angle_lut(),
       d_config_,
       d_points_,
@@ -339,55 +354,51 @@ private:
                total_point_count * sizeof(cuda::CudaNebulaPoint),
                cudaMemcpyDeviceToHost);
 
-    // === STEP 6: CPU post-processing grouped by entry_id ===
-    // Group points by entry_id (packet_id stored by batched kernel)
-    std::vector<std::vector<uint32_t>> entry_point_indices(n_entries);
+    // === STEP 6: CPU post-processing with dual-return filtering ===
+    // GPU kernel handles: range filtering, FOV filtering, overlap/scan assignment
+    // CPU performs: dual-return filtering (requires sensor-specific logic), mask filtering
+
+    // Group points by (entry_id, channel_id) for dual-return filtering
+    std::map<uint32_t, std::vector<std::vector<uint32_t>>> entry_channel_groups;
+
     for (uint32_t i = 0; i < total_point_count; ++i) {
-      uint32_t entry_id = cuda_point_buffer_[i].entry_id;
-      if (entry_id < n_entries) {
-        entry_point_indices[entry_id].push_back(i);
+      const auto & cuda_pt = cuda_point_buffer_[i];
+      uint32_t entry_id = cuda_pt.entry_id;
+      uint32_t channel_id = cuda_pt.channel;
+
+      if (entry_channel_groups.find(entry_id) == entry_channel_groups.end()) {
+        entry_channel_groups[entry_id].resize(n_channels);
       }
+      entry_channel_groups[entry_id][channel_id].push_back(i);
     }
 
     // Get packet timestamp for point time calculation
     uint64_t packet_timestamp_ns = hesai_packet::get_timestamp_ns(packet_);
 
-    // Process each entry's points with dual-return filtering, FOV filtering, scan assignment
-    for (uint32_t entry_id = 0; entry_id < n_entries; ++entry_id) {
-      const auto & point_indices = entry_point_indices[entry_id];
-      if (point_indices.empty()) continue;
+    // Process each entry's channel groups with dual-return filtering
+    for (const auto & [entry_id, channel_groups] : entry_channel_groups) {
+      // Get the actual n_returns for this entry
+      const uint32_t entry_n_returns = gpu_scan_buffer_.h_n_returns_staging[entry_id];
 
-      const uint32_t n_blocks = gpu_scan_buffer_.h_n_returns_staging[entry_id];
-      const uint32_t raw_azimuth = gpu_scan_buffer_.h_raw_azimuths_staging[entry_id];
-      const uint32_t entry_last_azimuth = gpu_scan_buffer_.h_last_azimuths_staging[entry_id];
-
-      // Group points by channel for dual-return filtering
-      std::vector<std::vector<uint32_t>> channel_point_indices(n_channels);
-      for (uint32_t pt_idx : point_indices) {
-        const auto & cuda_pt = cuda_point_buffer_[pt_idx];
-        if (cuda_pt.channel < n_channels) {
-          channel_point_indices[cuda_pt.channel].push_back(pt_idx);
-        }
-      }
-
-      // Process each channel with dual-return filtering
       for (size_t channel_id = 0; channel_id < n_channels; ++channel_id) {
-        const auto & indices = channel_point_indices[channel_id];
+        const auto & indices = channel_groups[channel_id];
         if (indices.empty()) continue;
 
+        // Mark which points are valid after dual return filtering
         std::vector<bool> point_valid(indices.size(), true);
 
-        // Apply dual-return filtering
+        // Apply dual return filtering (distance threshold check)
         for (size_t idx = 0; idx < indices.size(); ++idx) {
           if (!point_valid[idx]) continue;
           const auto & pt = cuda_point_buffer_[indices[idx]];
 
-          if (pt.return_type < n_blocks - 1) {
+          // Only filter non-last returns
+          if (pt.return_type < entry_n_returns - 1) {
             for (size_t other_idx = 0; other_idx < indices.size(); ++other_idx) {
               if (other_idx == idx) continue;
               const auto & other_pt = cuda_point_buffer_[indices[other_idx]];
-              float distance_diff = std::abs(other_pt.distance - pt.distance);
-              if (distance_diff < config.dual_return_distance_threshold) {
+
+              if (std::abs(other_pt.distance - pt.distance) < config.dual_return_distance_threshold) {
                 point_valid[idx] = false;
                 break;
               }
@@ -400,21 +411,7 @@ private:
           if (!point_valid[idx]) continue;
 
           const auto & cuda_pt = cuda_point_buffer_[indices[idx]];
-
-          // FOV filtering
-          bool in_fov = angle_is_between(scan_cut_angles_.fov_min, scan_cut_angles_.fov_max, cuda_pt.azimuth);
-          if (!in_fov) continue;
-
-          // Overlap check using per-entry last_azimuth
-          bool in_current_scan = true;
-          if (angle_corrector_.is_inside_overlap(entry_last_azimuth, raw_azimuth) &&
-              angle_is_between(scan_cut_angles_.scan_emit_angle,
-                              scan_cut_angles_.scan_emit_angle + deg2rad(20),
-                              cuda_pt.azimuth)) {
-            in_current_scan = false;
-          }
-
-          auto & frame = in_current_scan ? decode_frame_ : output_frame_;
+          auto & frame = cuda_pt.in_current_scan ? decode_frame_ : output_frame_;
 
           NebulaPoint point;
           point.x = cuda_pt.x;
@@ -1012,11 +1009,10 @@ public:
             gpu_scan_buffer_.d_raw_azimuths = nullptr;
             use_scan_batching_ = false;
           } else {
-            // Allocate pinned host staging areas
-            err = cudaMallocHost(&gpu_scan_buffer_.h_distances_staging,
-                                 MAX_PACKETS_PER_SCAN * packet_data_size * sizeof(uint16_t));
+            err = cudaMalloc(&gpu_scan_buffer_.d_last_azimuths,
+                             MAX_PACKETS_PER_SCAN * sizeof(uint32_t));
             if (err != cudaSuccess) {
-              NEBULA_LOG_STREAM(logger_->warn, "Failed to allocate pinned scan distances staging buffer");
+              NEBULA_LOG_STREAM(logger_->warn, "Failed to allocate CUDA scan d_last_azimuths buffer");
               cudaFree(gpu_scan_buffer_.d_distances_ring);
               cudaFree(gpu_scan_buffer_.d_reflectivities_ring);
               cudaFree(gpu_scan_buffer_.d_raw_azimuths);
@@ -1027,6 +1023,23 @@ public:
               gpu_scan_buffer_.d_n_returns = nullptr;
               use_scan_batching_ = false;
             } else {
+            // Allocate pinned host staging areas
+            err = cudaMallocHost(&gpu_scan_buffer_.h_distances_staging,
+                                 MAX_PACKETS_PER_SCAN * packet_data_size * sizeof(uint16_t));
+            if (err != cudaSuccess) {
+              NEBULA_LOG_STREAM(logger_->warn, "Failed to allocate pinned scan distances staging buffer");
+              cudaFree(gpu_scan_buffer_.d_distances_ring);
+              cudaFree(gpu_scan_buffer_.d_reflectivities_ring);
+              cudaFree(gpu_scan_buffer_.d_raw_azimuths);
+              cudaFree(gpu_scan_buffer_.d_n_returns);
+              cudaFree(gpu_scan_buffer_.d_last_azimuths);
+              gpu_scan_buffer_.d_distances_ring = nullptr;
+              gpu_scan_buffer_.d_reflectivities_ring = nullptr;
+              gpu_scan_buffer_.d_raw_azimuths = nullptr;
+              gpu_scan_buffer_.d_n_returns = nullptr;
+              gpu_scan_buffer_.d_last_azimuths = nullptr;
+              use_scan_batching_ = false;
+            } else {
               err = cudaMallocHost(&gpu_scan_buffer_.h_reflectivities_staging,
                                    MAX_PACKETS_PER_SCAN * packet_data_size * sizeof(uint8_t));
               if (err != cudaSuccess) {
@@ -1035,11 +1048,13 @@ public:
                 cudaFree(gpu_scan_buffer_.d_reflectivities_ring);
                 cudaFree(gpu_scan_buffer_.d_raw_azimuths);
                 cudaFree(gpu_scan_buffer_.d_n_returns);
+                cudaFree(gpu_scan_buffer_.d_last_azimuths);
                 cudaFreeHost(gpu_scan_buffer_.h_distances_staging);
                 gpu_scan_buffer_.d_distances_ring = nullptr;
                 gpu_scan_buffer_.d_reflectivities_ring = nullptr;
                 gpu_scan_buffer_.d_raw_azimuths = nullptr;
                 gpu_scan_buffer_.d_n_returns = nullptr;
+                gpu_scan_buffer_.d_last_azimuths = nullptr;
                 gpu_scan_buffer_.h_distances_staging = nullptr;
                 use_scan_batching_ = false;
               } else {
@@ -1051,12 +1066,14 @@ public:
                   cudaFree(gpu_scan_buffer_.d_reflectivities_ring);
                   cudaFree(gpu_scan_buffer_.d_raw_azimuths);
                   cudaFree(gpu_scan_buffer_.d_n_returns);
+                  cudaFree(gpu_scan_buffer_.d_last_azimuths);
                   cudaFreeHost(gpu_scan_buffer_.h_distances_staging);
                   cudaFreeHost(gpu_scan_buffer_.h_reflectivities_staging);
                   gpu_scan_buffer_.d_distances_ring = nullptr;
                   gpu_scan_buffer_.d_reflectivities_ring = nullptr;
                   gpu_scan_buffer_.d_raw_azimuths = nullptr;
                   gpu_scan_buffer_.d_n_returns = nullptr;
+                  gpu_scan_buffer_.d_last_azimuths = nullptr;
                   gpu_scan_buffer_.h_distances_staging = nullptr;
                   gpu_scan_buffer_.h_reflectivities_staging = nullptr;
                   use_scan_batching_ = false;
@@ -1069,6 +1086,7 @@ public:
                     cudaFree(gpu_scan_buffer_.d_reflectivities_ring);
                     cudaFree(gpu_scan_buffer_.d_raw_azimuths);
                     cudaFree(gpu_scan_buffer_.d_n_returns);
+                    cudaFree(gpu_scan_buffer_.d_last_azimuths);
                     cudaFreeHost(gpu_scan_buffer_.h_distances_staging);
                     cudaFreeHost(gpu_scan_buffer_.h_reflectivities_staging);
                     cudaFreeHost(gpu_scan_buffer_.h_raw_azimuths_staging);
@@ -1076,6 +1094,7 @@ public:
                     gpu_scan_buffer_.d_reflectivities_ring = nullptr;
                     gpu_scan_buffer_.d_raw_azimuths = nullptr;
                     gpu_scan_buffer_.d_n_returns = nullptr;
+                    gpu_scan_buffer_.d_last_azimuths = nullptr;
                     gpu_scan_buffer_.h_distances_staging = nullptr;
                     gpu_scan_buffer_.h_reflectivities_staging = nullptr;
                     gpu_scan_buffer_.h_raw_azimuths_staging = nullptr;
@@ -1089,6 +1108,7 @@ public:
                       cudaFree(gpu_scan_buffer_.d_reflectivities_ring);
                       cudaFree(gpu_scan_buffer_.d_raw_azimuths);
                       cudaFree(gpu_scan_buffer_.d_n_returns);
+                      cudaFree(gpu_scan_buffer_.d_last_azimuths);
                       cudaFreeHost(gpu_scan_buffer_.h_distances_staging);
                       cudaFreeHost(gpu_scan_buffer_.h_reflectivities_staging);
                       cudaFreeHost(gpu_scan_buffer_.h_raw_azimuths_staging);
@@ -1097,6 +1117,7 @@ public:
                       gpu_scan_buffer_.d_reflectivities_ring = nullptr;
                       gpu_scan_buffer_.d_raw_azimuths = nullptr;
                       gpu_scan_buffer_.d_n_returns = nullptr;
+                      gpu_scan_buffer_.d_last_azimuths = nullptr;
                       gpu_scan_buffer_.h_distances_staging = nullptr;
                       gpu_scan_buffer_.h_reflectivities_staging = nullptr;
                       gpu_scan_buffer_.h_raw_azimuths_staging = nullptr;
@@ -1114,6 +1135,7 @@ public:
                 }
               }
             }
+            }  // Close d_last_azimuths else block
           }
         }
       }

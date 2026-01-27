@@ -33,8 +33,8 @@ struct CudaNebulaPoint
   float intensity;
   uint8_t return_type;
   uint16_t channel;
-  uint8_t padding;       // Padding for alignment
-  uint32_t entry_id;     // Block group ID for batched processing (used for sorting & filtering)
+  uint8_t in_current_scan;  // 1 = belongs to current scan, 0 = belongs to output/next scan
+  uint32_t entry_id;        // Block group ID for batched processing (used for sorting & filtering)
 };
 
 /// @brief Angle correction data for CUDA lookup table
@@ -65,6 +65,10 @@ struct CudaDecoderConfig
   float dis_unit;
   uint32_t data_stride;  // Stride between channels in input data (for batched mode)
   uint32_t entry_id;     // Entry ID for batched mode (0 in per-packet mode)
+  // Overlap detection parameters (raw azimuth in 0.01 degree units)
+  uint32_t timestamp_reset_angle_raw;
+  uint32_t emit_angle_raw;
+  uint32_t n_azimuths_raw;  // Total azimuth count (e.g., 36000 for 0.01 deg resolution)
 };
 
 /// @brief Main CUDA decoder class for Hesai LiDAR
