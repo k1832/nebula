@@ -20,6 +20,11 @@
 
 #include <pcl_conversions/pcl_conversions.h>
 
+// CUDA blackboard for GPU zero-copy pipeline
+#if defined(CUDA_BLACKBOARD_AVAILABLE) && defined(NEBULA_CUDA_ENABLED)
+#include <cuda_blackboard/cuda_unique_ptr.hpp>
+#endif
+
 #include <algorithm>
 #include <memory>
 #include <utility>
@@ -92,6 +97,14 @@ HesaiDecoderWrapper::HesaiDecoderWrapper(
     sensor_msgs::msg::PointCloud2, &parent_node_, "aw_points", pointcloud_qos);
   aw_points_ex_pub_ = NEBULA_CREATE_PUBLISHER2(
     sensor_msgs::msg::PointCloud2, &parent_node_, "aw_points_ex", pointcloud_qos);
+
+#if defined(CUDA_BLACKBOARD_AVAILABLE) && defined(NEBULA_CUDA_ENABLED)
+  // Initialize CUDA pipeline if GPU pipeline mode is enabled
+  if (sensor_cfg_->gpu_pipeline_mode) {
+    RCLCPP_INFO(logger_, "GPU pipeline mode enabled - initializing CUDA blackboard publisher");
+    initialize_cuda_pipeline();
+  }
+#endif
 
   RCLCPP_INFO_STREAM(logger_, ". Wrapper=" << status_);
 
@@ -185,15 +198,33 @@ void HesaiDecoderWrapper::on_pointcloud_decoded(
     current_scan_msg_ = std::make_unique<pandar_msgs::msg::PandarScan>();
   }
 
+#if defined(CUDA_BLACKBOARD_AVAILABLE) && defined(NEBULA_CUDA_ENABLED)
+  // GPU PIPELINE PATH: Publish via cuda_blackboard for zero-copy downstream processing
+  if (sensor_cfg_->gpu_pipeline_mode && cuda_points_pub_) {
+    std::lock_guard lock(mtx_driver_ptr_);
+    if (driver_ptr_) {
+      auto gpu_cloud = driver_ptr_->get_gpu_pointcloud();
+      if (gpu_cloud.valid) {
+        publish_cuda_pointcloud(gpu_cloud, timestamp_s);
+      }
+    }
+  }
+#endif
+
+  // CPU PIPELINE PATH: Standard ROS2 publishing
+  // In GPU pipeline mode, CPU pointcloud may be empty (D2H copy skipped)
+  // Only publish if there are points OR if not in GPU pipeline mode
   rclcpp::Time cloud_stamp = rclcpp::Time(seconds_to_chrono_nano_seconds(timestamp_s).count());
 
-  if (NEBULA_HAS_ANY_SUBSCRIPTIONS(nebula_points_pub_)) {
+  const bool has_cpu_points = pointcloud && !pointcloud->empty();
+
+  if (has_cpu_points && NEBULA_HAS_ANY_SUBSCRIPTIONS(nebula_points_pub_)) {
     auto ros_pc_msg_ptr = ALLOCATE_OUTPUT_MESSAGE_UNIQUE(nebula_points_pub_);
     pcl::toROSMsg(*pointcloud, *ros_pc_msg_ptr);
     ros_pc_msg_ptr->header.stamp = cloud_stamp;
     publish_cloud(std::move(ros_pc_msg_ptr), nebula_points_pub_);
   }
-  if (NEBULA_HAS_ANY_SUBSCRIPTIONS(aw_points_base_pub_)) {
+  if (has_cpu_points && NEBULA_HAS_ANY_SUBSCRIPTIONS(aw_points_base_pub_)) {
     const auto autoware_cloud_xyzi =
       nebula::drivers::convert_point_xyzircaedt_to_point_xyzir(pointcloud);
     auto ros_pc_msg_ptr = ALLOCATE_OUTPUT_MESSAGE_UNIQUE(aw_points_base_pub_);
@@ -201,7 +232,7 @@ void HesaiDecoderWrapper::on_pointcloud_decoded(
     ros_pc_msg_ptr->header.stamp = cloud_stamp;
     publish_cloud(std::move(ros_pc_msg_ptr), aw_points_base_pub_);
   }
-  if (NEBULA_HAS_ANY_SUBSCRIPTIONS(aw_points_ex_pub_)) {
+  if (has_cpu_points && NEBULA_HAS_ANY_SUBSCRIPTIONS(aw_points_ex_pub_)) {
     const auto autoware_ex_cloud =
       nebula::drivers::convert_point_xyzircaedt_to_point_xyziradt(pointcloud, timestamp_s);
     auto ros_pc_msg_ptr = ALLOCATE_OUTPUT_MESSAGE_UNIQUE(aw_points_ex_pub_);
@@ -338,4 +369,161 @@ nebula::Status HesaiDecoderWrapper::status()
 
   return driver_ptr_->get_status();
 }
+
+// =============================================================================
+// CUDA BLACKBOARD INTEGRATION FOR GPU PIPELINE MODE
+// =============================================================================
+
+#if defined(CUDA_BLACKBOARD_AVAILABLE) && defined(NEBULA_CUDA_ENABLED)
+
+void HesaiDecoderWrapper::initialize_cuda_pipeline()
+{
+  // Create CUDA stream for format conversion
+  cudaError_t err = cudaStreamCreate(&cuda_conversion_stream_);
+  if (err != cudaSuccess) {
+    RCLCPP_WARN(logger_, "Failed to create CUDA conversion stream: %s", cudaGetErrorString(err));
+    return;
+  }
+
+  // Allocate device memory for output count
+  err = cudaMalloc(&d_output_count_, sizeof(uint32_t));
+  if (err != cudaSuccess) {
+    RCLCPP_WARN(logger_, "Failed to allocate CUDA output count: %s", cudaGetErrorString(err));
+    cudaStreamDestroy(cuda_conversion_stream_);
+    cuda_conversion_stream_ = nullptr;
+    return;
+  }
+
+  // Create cuda_blackboard publisher
+  cuda_points_pub_ = std::make_unique<
+    cuda_blackboard::CudaBlackboardPublisher<cuda_blackboard::CudaPointCloud2>>(
+    parent_node_, "pandar_points_cuda");
+
+  RCLCPP_INFO(logger_, "CUDA pipeline initialized for GPU zero-copy publishing");
+}
+
+void HesaiDecoderWrapper::cleanup_cuda_pipeline()
+{
+  cuda_points_pub_.reset();
+
+  if (d_pointcloud2_buffer_) {
+    cudaFree(d_pointcloud2_buffer_);
+    d_pointcloud2_buffer_ = nullptr;
+  }
+
+  if (d_output_count_) {
+    cudaFree(d_output_count_);
+    d_output_count_ = nullptr;
+  }
+
+  if (cuda_conversion_stream_) {
+    cudaStreamDestroy(cuda_conversion_stream_);
+    cuda_conversion_stream_ = nullptr;
+  }
+}
+
+std::vector<sensor_msgs::msg::PointField> HesaiDecoderWrapper::create_xyzircaedt_fields()
+{
+  std::vector<sensor_msgs::msg::PointField> fields;
+
+  auto add_field = [&fields](const char* name, uint32_t offset, uint8_t datatype, uint32_t count) {
+    sensor_msgs::msg::PointField field;
+    field.name = name;
+    field.offset = offset;
+    field.datatype = datatype;
+    field.count = count;
+    fields.push_back(field);
+  };
+
+  // PointXYZIRCAEDT layout (32 bytes total)
+  add_field("x", 0, sensor_msgs::msg::PointField::FLOAT32, 1);
+  add_field("y", 4, sensor_msgs::msg::PointField::FLOAT32, 1);
+  add_field("z", 8, sensor_msgs::msg::PointField::FLOAT32, 1);
+  add_field("intensity", 12, sensor_msgs::msg::PointField::UINT8, 1);
+  add_field("return_type", 13, sensor_msgs::msg::PointField::UINT8, 1);
+  add_field("channel", 14, sensor_msgs::msg::PointField::UINT16, 1);
+  add_field("azimuth", 16, sensor_msgs::msg::PointField::FLOAT32, 1);
+  add_field("elevation", 20, sensor_msgs::msg::PointField::FLOAT32, 1);
+  add_field("distance", 24, sensor_msgs::msg::PointField::FLOAT32, 1);
+  add_field("time_stamp", 28, sensor_msgs::msg::PointField::UINT32, 1);
+
+  return fields;
+}
+
+void HesaiDecoderWrapper::publish_cuda_pointcloud(
+  const drivers::cuda::GpuPointCloud& gpu_cloud,
+  double timestamp_s)
+{
+  if (!cuda_points_pub_ || !gpu_cloud.valid || gpu_cloud.point_count == 0) {
+    return;
+  }
+
+  // Ensure we have enough buffer space for PointCloud2 format (32 bytes per point)
+  const size_t required_size = gpu_cloud.point_count * drivers::cuda::POINTCLOUD2_POINT_STEP;
+  if (required_size > pointcloud2_buffer_size_) {
+    // Reallocate with some headroom
+    if (d_pointcloud2_buffer_) {
+      cudaFree(d_pointcloud2_buffer_);
+    }
+    pointcloud2_buffer_size_ = required_size * 2;  // 2x headroom
+    cudaError_t err = cudaMalloc(&d_pointcloud2_buffer_, pointcloud2_buffer_size_);
+    if (err != cudaSuccess) {
+      RCLCPP_ERROR(logger_, "Failed to allocate PointCloud2 buffer: %s", cudaGetErrorString(err));
+      pointcloud2_buffer_size_ = 0;
+      d_pointcloud2_buffer_ = nullptr;
+      return;
+    }
+  }
+
+  // Launch format conversion kernel
+  // filter_current_scan=true: only include points marked as current scan
+  launch_convert_to_pointcloud2(
+    gpu_cloud.d_points,
+    d_pointcloud2_buffer_,
+    d_output_count_,
+    gpu_cloud.point_count,
+    true,  // filter_current_scan
+    cuda_conversion_stream_);
+
+  // Get actual output count
+  uint32_t output_count = 0;
+  cudaMemcpyAsync(&output_count, d_output_count_, sizeof(uint32_t),
+                  cudaMemcpyDeviceToHost, cuda_conversion_stream_);
+  cudaStreamSynchronize(cuda_conversion_stream_);
+
+  if (output_count == 0) {
+    return;
+  }
+
+  // Create CudaPointCloud2 message
+  auto cuda_msg = std::make_unique<cuda_blackboard::CudaPointCloud2>();
+
+  // Set header
+  cuda_msg->header.stamp = rclcpp::Time(seconds_to_chrono_nano_seconds(timestamp_s).count());
+  cuda_msg->header.frame_id = sensor_cfg_->frame_id;
+
+  // Set dimensions
+  cuda_msg->height = 1;
+  cuda_msg->width = output_count;
+  cuda_msg->point_step = drivers::cuda::POINTCLOUD2_POINT_STEP;
+  cuda_msg->row_step = cuda_msg->point_step * cuda_msg->width;
+  cuda_msg->is_dense = true;
+  cuda_msg->is_bigendian = false;
+
+  // Set field descriptors
+  cuda_msg->fields = create_xyzircaedt_fields();
+
+  // Allocate GPU memory for the message and copy data
+  const size_t data_size = cuda_msg->row_step;
+  cuda_msg->data = cuda_blackboard::make_unique<uint8_t[]>(data_size);
+  cudaMemcpyAsync(cuda_msg->data.get(), d_pointcloud2_buffer_, data_size,
+                  cudaMemcpyDeviceToDevice, cuda_conversion_stream_);
+  cudaStreamSynchronize(cuda_conversion_stream_);
+
+  // Publish via cuda_blackboard
+  cuda_points_pub_->publish(std::move(cuda_msg));
+}
+
+#endif  // CUDA_BLACKBOARD_AVAILABLE && NEBULA_CUDA_ENABLED
+
 }  // namespace nebula::ros

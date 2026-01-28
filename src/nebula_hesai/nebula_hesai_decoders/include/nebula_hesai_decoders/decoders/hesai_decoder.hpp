@@ -178,6 +178,7 @@ private:
     uint32_t* h_raw_azimuths_staging = nullptr;
     uint32_t* h_n_returns_staging = nullptr;
     uint32_t* h_last_azimuths_staging = nullptr;  // Per-entry last_azimuth for overlap check
+    uint64_t* h_packet_timestamps_staging = nullptr;  // Per-entry packet timestamp for time_stamp calculation
 
     // Metadata
     uint32_t packet_count = 0;           // Packets accumulated so far
@@ -191,6 +192,10 @@ private:
 
   GpuScanBuffer gpu_scan_buffer_;
 
+  /// Cached GPU output state for zero-copy access (updated after flush)
+  uint32_t gpu_output_point_count_ = 0;
+  uint64_t gpu_output_timestamp_ns_ = 0;
+
   /// Feature flag for scan-level CUDA batching.
   /// When enabled, packet data is accumulated and processed in batch at scan boundaries,
   /// eliminating per-packet kernel launch overhead (~30us × ~3000 packets = ~90ms per scan).
@@ -199,7 +204,7 @@ private:
   /// non-batched mode (same point count, minor coordinate difference at first point).
   /// This appears to be due to subtle GPU execution ordering differences and does not
   /// affect point cloud accuracy. All other sensor types pass correctness tests.
-  bool use_scan_batching_ = true;
+  bool use_scan_batching_ = true;  // Batched kernel with deterministic ordering
 
   static constexpr uint32_t MAX_PACKETS_PER_SCAN = 4000;
 #endif
@@ -247,6 +252,8 @@ private:
     gpu_scan_buffer_.h_n_returns_staging[entry_id] = n_blocks;
     // Store current last_azimuth_ for overlap check (this is what last_azimuth_ was BEFORE this entry)
     gpu_scan_buffer_.h_last_azimuths_staging[entry_id] = last_azimuth_;
+    // Store packet timestamp for time_stamp calculation during post-processing
+    gpu_scan_buffer_.h_packet_timestamps_staging[entry_id] = hesai_packet::get_timestamp_ns(packet_);
 
     // Extract distances/reflectivities to pinned host memory
     // Layout: [entry][channel][return] with max_returns stride
@@ -298,6 +305,8 @@ private:
       config.emit_angle_raw = angle_corrector_.emit_angle_raw_;
     }
     config.n_azimuths_raw = cuda_n_azimuths_;
+    // Sparse output buffer size for deterministic indexing (global_tid -> output position)
+    config.max_output_points = n_entries * n_channels * max_returns;
 
     // === STEP 1: Bulk copy ALL data to GPU (ONE transfer per buffer) ===
     cudaMemcpyAsync(gpu_scan_buffer_.d_distances_ring, gpu_scan_buffer_.h_distances_staging,
@@ -318,8 +327,14 @@ private:
     cudaMemcpyAsync(d_config_, &config, sizeof(config),
                     cudaMemcpyHostToDevice, cuda_stream_);
 
-    // === STEP 2: Reset output counter ONCE ===
+    // === STEP 2: Reset output counter and ZERO output buffer ===
+    // Zeroing the output buffer is critical for deterministic indexing:
+    // - Kernel writes to global_tid positions (sparse)
+    // - Unwritten positions have distance=0 (marks invalid)
+    // - CPU post-processing skips distance<=0 points
     cudaMemsetAsync(d_count_, 0, sizeof(uint32_t), cuda_stream_);
+    const uint32_t sparse_output_size = n_entries * n_channels * max_returns;
+    cudaMemsetAsync(d_points_, 0, sparse_output_size * sizeof(cuda::CudaNebulaPoint), cuda_stream_);
 
     // === STEP 3: Launch ONE batched kernel for entire scan ===
     // Kernel now includes GPU FOV filtering and overlap/scan assignment
@@ -340,95 +355,69 @@ private:
     // === STEP 4: Synchronize ONCE ===
     cudaStreamSynchronize(cuda_stream_);
 
-    // === STEP 5: Copy ALL results back at once ===
-    uint32_t total_point_count = 0;
-    cudaMemcpy(&total_point_count, d_count_, sizeof(uint32_t), cudaMemcpyDeviceToHost);
+    // === STEP 5: Get valid point count from GPU ===
+    // Note: With deterministic indexing, points are written to sparse positions
+    // The count tells us how many valid points exist, but they're not contiguous
+    uint32_t valid_point_count = 0;
+    cudaMemcpy(&valid_point_count, d_count_, sizeof(uint32_t), cudaMemcpyDeviceToHost);
 
-    if (total_point_count == 0) {
+    // Calculate total sparse buffer size (all potential point positions)
+    const uint32_t sparse_buffer_size = n_entries * n_channels * max_returns;
+
+    // Update GPU output state for zero-copy access
+    gpu_output_point_count_ = std::min(valid_point_count, static_cast<uint32_t>(cuda_point_buffer_.size()));
+    gpu_output_timestamp_ns_ = decode_frame_.scan_timestamp_ns;
+
+    if (valid_point_count == 0) {
       gpu_scan_buffer_.packet_count = 0;
       return;
     }
 
-    total_point_count = std::min(total_point_count, static_cast<uint32_t>(cuda_point_buffer_.size()));
-    cudaMemcpy(cuda_point_buffer_.data(), d_points_,
-               total_point_count * sizeof(cuda::CudaNebulaPoint),
-               cudaMemcpyDeviceToHost);
+    // === STEP 6: Copy to host and process (ONLY if not in GPU pipeline mode) ===
+    // GPU pipeline mode: data stays on GPU for downstream CUDA consumers
+    if (!sensor_configuration_->gpu_pipeline_mode) {
+      // Copy SPARSE buffer - points are at deterministic positions with gaps
+      // We copy the full sparse buffer and filter on CPU for deterministic ordering
+      const uint32_t copy_size = std::min(sparse_buffer_size, static_cast<uint32_t>(cuda_point_buffer_.size()));
+      cudaMemcpy(cuda_point_buffer_.data(), d_points_,
+                 copy_size * sizeof(cuda::CudaNebulaPoint),
+                 cudaMemcpyDeviceToHost);
 
-    // === STEP 6: CPU post-processing with dual-return filtering ===
-    // GPU kernel handles: range filtering, FOV filtering, overlap/scan assignment
-    // CPU performs: dual-return filtering (requires sensor-specific logic), mask filtering
+      // CPU post-processing: iterate sparse buffer, skip invalid points (distance <= 0)
+      // This preserves deterministic ordering from global_tid indexing
 
-    // Group points by (entry_id, channel_id) for dual-return filtering
-    std::map<uint32_t, std::vector<std::vector<uint32_t>>> entry_channel_groups;
+      for (uint32_t i = 0; i < copy_size; ++i) {
+        const auto & cuda_pt = cuda_point_buffer_[i];
 
-    for (uint32_t i = 0; i < total_point_count; ++i) {
-      const auto & cuda_pt = cuda_point_buffer_[i];
-      uint32_t entry_id = cuda_pt.entry_id;
-      uint32_t channel_id = cuda_pt.channel;
-
-      if (entry_channel_groups.find(entry_id) == entry_channel_groups.end()) {
-        entry_channel_groups[entry_id].resize(n_channels);
-      }
-      entry_channel_groups[entry_id][channel_id].push_back(i);
-    }
-
-    // Get packet timestamp for point time calculation
-    uint64_t packet_timestamp_ns = hesai_packet::get_timestamp_ns(packet_);
-
-    // Process each entry's channel groups with dual-return filtering
-    for (const auto & [entry_id, channel_groups] : entry_channel_groups) {
-      // Get the actual n_returns for this entry
-      const uint32_t entry_n_returns = gpu_scan_buffer_.h_n_returns_staging[entry_id];
-
-      for (size_t channel_id = 0; channel_id < n_channels; ++channel_id) {
-        const auto & indices = channel_groups[channel_id];
-        if (indices.empty()) continue;
-
-        // Mark which points are valid after dual return filtering
-        std::vector<bool> point_valid(indices.size(), true);
-
-        // Apply dual return filtering (distance threshold check)
-        for (size_t idx = 0; idx < indices.size(); ++idx) {
-          if (!point_valid[idx]) continue;
-          const auto & pt = cuda_point_buffer_[indices[idx]];
-
-          // Only filter non-last returns
-          if (pt.return_type < entry_n_returns - 1) {
-            for (size_t other_idx = 0; other_idx < indices.size(); ++other_idx) {
-              if (other_idx == idx) continue;
-              const auto & other_pt = cuda_point_buffer_[indices[other_idx]];
-
-              if (std::abs(other_pt.distance - pt.distance) < config.dual_return_distance_threshold) {
-                point_valid[idx] = false;
-                break;
-              }
-            }
-          }
+        // Skip invalid/filtered points (distance <= 0 means not written by kernel)
+        if (cuda_pt.distance <= 0.0f) {
+          continue;
         }
 
-        // Add valid points to pointcloud
-        for (size_t idx = 0; idx < indices.size(); ++idx) {
-          if (!point_valid[idx]) continue;
+        auto & frame = cuda_pt.in_current_scan ? decode_frame_ : output_frame_;
 
-          const auto & cuda_pt = cuda_point_buffer_[indices[idx]];
-          auto & frame = cuda_pt.in_current_scan ? decode_frame_ : output_frame_;
+        // Get the correct packet timestamp for this point using its entry_id
+        // entry_id was stored in the kernel and corresponds to the packet index
+        const uint32_t entry_id = cuda_pt.entry_id;
+        const uint64_t packet_timestamp_ns = (entry_id < n_entries) ?
+          gpu_scan_buffer_.h_packet_timestamps_staging[entry_id] :
+          hesai_packet::get_timestamp_ns(packet_);  // Fallback for safety
 
-          NebulaPoint point;
-          point.x = cuda_pt.x;
-          point.y = cuda_pt.y;
-          point.z = cuda_pt.z;
-          point.distance = cuda_pt.distance;
-          point.azimuth = cuda_pt.azimuth;
-          point.elevation = cuda_pt.elevation;
-          point.intensity = cuda_pt.intensity;
-          point.return_type = cuda_pt.return_type;
-          point.channel = cuda_pt.channel;
-          point.time_stamp = get_point_time_relative(
-            frame.scan_timestamp_ns, packet_timestamp_ns, 0, cuda_pt.channel);
+        NebulaPoint point;
+        point.x = cuda_pt.x;
+        point.y = cuda_pt.y;
+        point.z = cuda_pt.z;
+        point.distance = cuda_pt.distance;
+        point.azimuth = cuda_pt.azimuth;
+        point.elevation = cuda_pt.elevation;
+        point.intensity = cuda_pt.intensity;
+        point.return_type = cuda_pt.return_type;
+        point.channel = cuda_pt.channel;
+        point.time_stamp = get_point_time_relative(
+          frame.scan_timestamp_ns, packet_timestamp_ns, 0, cuda_pt.channel);
 
-          if (!mask_filter_ || !mask_filter_->excluded(point)) {
-            frame.pointcloud->emplace_back(point);
-          }
+        if (!mask_filter_ || !mask_filter_->excluded(point)) {
+          frame.pointcloud->emplace_back(point);
         }
       }
     }
@@ -862,15 +851,21 @@ public:
     cuda_decoder_ = std::make_unique<cuda::HesaiCudaDecoder>();
     const size_t max_points = SensorT::max_scan_buffer_points;
     const uint32_t n_channels = SensorT::packet_t::n_channels;
+    // For batched mode, the sparse output buffer needs to hold all potential point positions
+    // (not just valid points). This is: MAX_PACKETS_PER_SCAN × n_channels × max_returns
+    const size_t max_sparse_buffer_points = static_cast<size_t>(MAX_PACKETS_PER_SCAN) *
+                                            n_channels * SensorT::packet_t::max_returns;
+    // Use the larger of the two for buffer allocation
+    const size_t buffer_allocation_size = std::max(max_points, max_sparse_buffer_points);
 
-    if (!cuda_decoder_->initialize(max_points, n_channels)) {
+    if (!cuda_decoder_->initialize(buffer_allocation_size, n_channels)) {
       NEBULA_LOG_STREAM(logger_->warn, "Failed to initialize CUDA decoder");
       cuda_decoder_.reset();
       return;
     }
 
-    // Allocate device memory for output
-    err = cudaMalloc(&d_points_, max_points * sizeof(cuda::CudaNebulaPoint));
+    // Allocate device memory for output (use larger size for batched sparse mode)
+    err = cudaMalloc(&d_points_, buffer_allocation_size * sizeof(cuda::CudaNebulaPoint));
     if (err != cudaSuccess) {
       NEBULA_LOG_STREAM(logger_->warn, "Failed to allocate CUDA output points");
       cuda_decoder_.reset();
@@ -966,8 +961,8 @@ public:
       return;
     }
 
-    // Pre-allocate host buffer for results
-    cuda_point_buffer_.resize(max_points);
+    // Pre-allocate host buffer for results (use larger size for batched sparse mode)
+    cuda_point_buffer_.resize(buffer_allocation_size);
 
     // Allocate GPU scan buffer for batch processing
     const uint32_t packet_data_size = n_channels * SensorT::packet_t::max_returns;
@@ -1124,12 +1119,40 @@ public:
                       gpu_scan_buffer_.h_n_returns_staging = nullptr;
                       use_scan_batching_ = false;
                     } else {
-                      // Successfully allocated all buffers
-                      gpu_scan_buffer_.packet_count = 0;
-                      gpu_scan_buffer_.max_packets = MAX_PACKETS_PER_SCAN;
-                      gpu_scan_buffer_.d_points = d_points_;
-                      gpu_scan_buffer_.d_count = d_count_;
-                      NEBULA_LOG_STREAM(logger_->info, "GPU scan batching enabled");
+                      // Allocate packet timestamps staging buffer
+                      err = cudaMallocHost(&gpu_scan_buffer_.h_packet_timestamps_staging,
+                                           MAX_PACKETS_PER_SCAN * sizeof(uint64_t));
+                      if (err != cudaSuccess) {
+                        NEBULA_LOG_STREAM(logger_->warn, "Failed to allocate pinned scan timestamps staging buffer");
+                        cudaFree(gpu_scan_buffer_.d_distances_ring);
+                        cudaFree(gpu_scan_buffer_.d_reflectivities_ring);
+                        cudaFree(gpu_scan_buffer_.d_raw_azimuths);
+                        cudaFree(gpu_scan_buffer_.d_n_returns);
+                        cudaFree(gpu_scan_buffer_.d_last_azimuths);
+                        cudaFreeHost(gpu_scan_buffer_.h_distances_staging);
+                        cudaFreeHost(gpu_scan_buffer_.h_reflectivities_staging);
+                        cudaFreeHost(gpu_scan_buffer_.h_raw_azimuths_staging);
+                        cudaFreeHost(gpu_scan_buffer_.h_n_returns_staging);
+                        cudaFreeHost(gpu_scan_buffer_.h_last_azimuths_staging);
+                        gpu_scan_buffer_.d_distances_ring = nullptr;
+                        gpu_scan_buffer_.d_reflectivities_ring = nullptr;
+                        gpu_scan_buffer_.d_raw_azimuths = nullptr;
+                        gpu_scan_buffer_.d_n_returns = nullptr;
+                        gpu_scan_buffer_.d_last_azimuths = nullptr;
+                        gpu_scan_buffer_.h_distances_staging = nullptr;
+                        gpu_scan_buffer_.h_reflectivities_staging = nullptr;
+                        gpu_scan_buffer_.h_raw_azimuths_staging = nullptr;
+                        gpu_scan_buffer_.h_n_returns_staging = nullptr;
+                        gpu_scan_buffer_.h_last_azimuths_staging = nullptr;
+                        use_scan_batching_ = false;
+                      } else {
+                        // Successfully allocated all buffers
+                        gpu_scan_buffer_.packet_count = 0;
+                        gpu_scan_buffer_.max_packets = MAX_PACKETS_PER_SCAN;
+                        gpu_scan_buffer_.d_points = d_points_;
+                        gpu_scan_buffer_.d_count = d_count_;
+                        NEBULA_LOG_STREAM(logger_->info, "GPU scan batching enabled");
+                      }
                     }
                   }
                 }
@@ -1193,6 +1216,32 @@ public:
     if (cuda_stream_) {
       cudaStreamDestroy(cuda_stream_);
     }
+  }
+
+  /// @brief Get GPU point cloud for zero-copy downstream processing
+  /// Returns a struct containing device pointer to points and count.
+  /// Only valid when gpu_pipeline_mode is enabled in configuration.
+  /// The returned pointer is valid until the next flush or decoder destruction.
+  /// @return GpuPointCloud struct with device pointer, count, timestamp, and validity flag
+  cuda::GpuPointCloud get_gpu_pointcloud() const
+  {
+    cuda::GpuPointCloud result;
+    if (!cuda_enabled_ || !sensor_configuration_->gpu_pipeline_mode) {
+      return result;  // valid = false by default
+    }
+
+    result.d_points = d_points_;
+    result.point_count = gpu_output_point_count_;
+    result.timestamp_ns = gpu_output_timestamp_ns_;
+    result.valid = (gpu_output_point_count_ > 0);
+    return result;
+  }
+
+  /// @brief Check if GPU pipeline mode is active
+  /// @return true if CUDA is enabled and gpu_pipeline_mode is configured
+  bool is_gpu_pipeline_mode() const
+  {
+    return cuda_enabled_ && sensor_configuration_->gpu_pipeline_mode;
   }
 #endif
 

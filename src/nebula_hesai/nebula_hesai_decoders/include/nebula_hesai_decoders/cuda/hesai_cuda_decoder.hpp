@@ -69,6 +69,21 @@ struct CudaDecoderConfig
   uint32_t timestamp_reset_angle_raw;
   uint32_t emit_angle_raw;
   uint32_t n_azimuths_raw;  // Total azimuth count (e.g., 36000 for 0.01 deg resolution)
+  uint32_t max_output_points;  // Maximum output buffer size for sparse indexing (batched mode)
+};
+
+/// @brief GPU point cloud structure for zero-copy pipeline
+/// Allows downstream CUDA modules to access points directly on GPU without D2H copy
+struct GpuPointCloud
+{
+  /// Device pointer to point array (valid until next flush or decoder destruction)
+  const CudaNebulaPoint* d_points = nullptr;
+  /// Number of valid points in the buffer
+  uint32_t point_count = 0;
+  /// Timestamp of the scan in nanoseconds
+  uint64_t timestamp_ns = 0;
+  /// Whether the data is valid (false if not in GPU pipeline mode or no data available)
+  bool valid = false;
 };
 
 /// @brief Main CUDA decoder class for Hesai LiDAR
@@ -125,4 +140,75 @@ private:
   bool initialized_ = false;
 };
 
+/// @brief PointCloud2 format constants for PointXYZIRCAEDT
+constexpr uint32_t POINTCLOUD2_POINT_STEP = 32;  // sizeof(PointXYZIRCAEDT)
+
 }  // namespace nebula::drivers::cuda
+
+// =============================================================================
+// C-linkage function declarations for CUDA kernel launches
+// =============================================================================
+
+extern "C" {
+
+/// @brief Launch kernel to decode a single Hesai packet
+void launch_decode_hesai_packet(
+    const uint16_t* d_distances,
+    const uint8_t* d_reflectivities,
+    const nebula::drivers::cuda::CudaAngleCorrectionData* d_angle_lut,
+    const nebula::drivers::cuda::CudaDecoderConfig* d_config,
+    nebula::drivers::cuda::CudaNebulaPoint* d_points,
+    uint32_t* d_count,
+    uint32_t n_azimuths,
+    uint32_t raw_azimuth,
+    cudaStream_t stream);
+
+/// @brief Launch batched kernel to decode entire scan
+void launch_decode_hesai_scan_batch(
+    const uint16_t* d_distances_ring,
+    const uint8_t* d_reflectivities_ring,
+    const uint32_t* d_raw_azimuths,
+    const uint32_t* d_n_returns,
+    const uint32_t* d_last_azimuths,
+    const nebula::drivers::cuda::CudaAngleCorrectionData* d_angle_lut,
+    const nebula::drivers::cuda::CudaDecoderConfig* d_config,
+    nebula::drivers::cuda::CudaNebulaPoint* d_points,
+    uint32_t* d_count,
+    uint32_t n_azimuths,
+    uint32_t n_packets,
+    cudaStream_t stream);
+
+/// @brief Launch kernel to convert CudaNebulaPoint to PointCloud2 format
+/// Converts to PointXYZIRCAEDT layout (32 bytes per point)
+/// Uses atomic compaction to filter out invalid points
+/// @param d_input Input CudaNebulaPoint array
+/// @param d_output Output byte buffer (must be at least input_count * 32 bytes)
+/// @param d_output_count Output: number of valid points written
+/// @param input_count Number of input points
+/// @param filter_current_scan If true, only include points with in_current_scan=1
+/// @param stream CUDA stream for async execution
+void launch_convert_to_pointcloud2(
+    const nebula::drivers::cuda::CudaNebulaPoint* d_input,
+    uint8_t* d_output,
+    uint32_t* d_output_count,
+    uint32_t input_count,
+    bool filter_current_scan,
+    cudaStream_t stream);
+
+/// @brief Launch ordered conversion kernel (preserves point order, no compaction)
+/// Faster but may include invalid/zeroed points that need post-filtering
+/// @param d_input Input CudaNebulaPoint array
+/// @param d_output Output byte buffer
+/// @param d_valid_mask Optional output: validity mask (1=valid, 0=filtered)
+/// @param input_count Number of input points
+/// @param filter_current_scan If true, zero out points with in_current_scan=0
+/// @param stream CUDA stream for async execution
+void launch_convert_to_pointcloud2_ordered(
+    const nebula::drivers::cuda::CudaNebulaPoint* d_input,
+    uint8_t* d_output,
+    uint8_t* d_valid_mask,
+    uint32_t input_count,
+    bool filter_current_scan,
+    cudaStream_t stream);
+
+}  // extern "C"

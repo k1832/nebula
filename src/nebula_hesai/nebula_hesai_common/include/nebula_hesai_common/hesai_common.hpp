@@ -197,6 +197,9 @@ struct HesaiSensorConfiguration : public LidarConfigurationBase
   std::optional<uint32_t> blockage_mask_horizontal_bin_size_mdeg;
   std::optional<std::string> sync_diagnostics_topic;
   std::optional<AdvancedFunctionalSafetyConfiguration> functional_safety;
+  /// If true, keep decoded points on GPU for downstream CUDA processing (zero-copy)
+  /// When enabled, get_gpu_pointcloud() returns valid device pointers without D2H copy
+  bool gpu_pipeline_mode = false;
 };
 /// @brief Convert HesaiSensorConfiguration to string (Overloading the << operator)
 /// @param os
@@ -250,6 +253,8 @@ inline std::ostream & operator<<(std::ostream & os, HesaiSensorConfiguration con
       os << "basic";
     }
   }
+  os << '\n';
+  os << "GPU Pipeline Mode: " << (arg.gpu_pipeline_mode ? "enabled" : "disabled");
   return os;
 }
 

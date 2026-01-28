@@ -4,6 +4,17 @@ project(nebula_hesai)
 find_package(autoware_cmake REQUIRED)
 autoware_package()
 
+# Check for CUDA support (propagated from nebula_hesai_decoders)
+find_package(cuda_blackboard QUIET)
+find_package(negotiated QUIET)
+if(cuda_blackboard_FOUND AND negotiated_FOUND)
+  message(STATUS "cuda_blackboard found - GPU pipeline mode will be available")
+  set(CUDA_BLACKBOARD_AVAILABLE TRUE)
+else()
+  message(STATUS "cuda_blackboard not found - GPU pipeline mode will not be available")
+  set(CUDA_BLACKBOARD_AVAILABLE FALSE)
+endif()
+
 if(BUILD_TESTING OR BUILD_EXAMPLES)
   find_package(PCL REQUIRED components common io)
 else()
@@ -48,6 +59,12 @@ if("$ENV{ENABLE_AGNOCAST}")
   message("Agnocast support is enabled")
   ament_target_dependencies(hesai_ros_wrapper PUBLIC agnocastlib)
   add_definitions(-DUSE_AGNOCAST_ENABLED)
+endif()
+
+# Link cuda_blackboard for GPU pipeline mode
+if(CUDA_BLACKBOARD_AVAILABLE)
+  ament_target_dependencies(hesai_ros_wrapper PUBLIC cuda_blackboard negotiated)
+  target_compile_definitions(hesai_ros_wrapper PUBLIC CUDA_BLACKBOARD_AVAILABLE)
 endif()
 
 rclcpp_components_register_node(hesai_ros_wrapper PLUGIN "nebula::ros::HesaiRosWrapper"
@@ -198,6 +215,10 @@ ament_export_dependencies(
 
 if("$ENV{ENABLE_AGNOCAST}")
   ament_export_dependencies(agnocastlib)
+endif()
+
+if(CUDA_BLACKBOARD_AVAILABLE)
+  ament_export_dependencies(cuda_blackboard negotiated)
 endif()
 
 ament_package()

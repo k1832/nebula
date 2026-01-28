@@ -173,6 +173,9 @@ __global__ void decode_hesai_scan_batch_kernel(
   if (global_tid >= total_work) return;
 
   // Decompose thread ID into (packet_id, channel_id, return_id)
+  // Order matches CPU iteration: for each packet, for each channel, for each return/block
+  // CPU: outer loop = channel, inner loop = return/block
+  // So: packet varies slowest, channel varies middle, return varies fastest
   const uint32_t packet_id = global_tid / (config.n_channels * config.max_returns);
   const uint32_t channel_id = (global_tid / config.max_returns) % config.n_channels;
   const uint32_t return_id = global_tid % config.max_returns;
@@ -232,11 +235,64 @@ __global__ void decode_hesai_scan_batch_kernel(
     }
   }
 
-  // NOTE: Dual-return filtering remains on CPU because it requires:
-  // 1. IDENTICAL return type detection via sensor_.get_return_type() (sensor-specific)
-  // 2. Distance threshold comparison with proper handling of return types
-  // GPU handles: range filtering, FOV filtering, overlap/scan assignment
-  // CPU handles: dual-return filtering, mask filtering
+  // === DUAL-RETURN FILTERING (GPU) - OPTIMIZED ===
+  // Matches CPU logic: keep only last of multiple identical/close points
+  // This filtering happens BEFORE coordinate computation to avoid wasted work
+  const uint32_t n_returns = d_n_returns[packet_id];
+
+  // Last return is always kept - early exit (most common path for last return threads)
+  // Single-return mode also skips filtering entirely
+  if (return_id >= n_returns - 1) {
+    goto compute_coordinates;
+  }
+
+  // Calculate base offset for this (packet_id, channel_id) group
+  {
+    const uint32_t group_base = packet_id * (config.n_channels * config.max_returns)
+                               + channel_id * config.max_returns;
+    const float threshold = config.dual_return_distance_threshold;
+
+    // OPTIMIZATION: Special-case dual-return (most common mode)
+    // Avoids loop overhead - direct comparison with the last return only
+    if (n_returns == 2) {
+      // return_id must be 0 here (we already checked return_id >= n_returns - 1)
+      const uint32_t last_idx = group_base + 1;
+      const uint16_t last_raw_distance = d_distances_ring[last_idx];
+      const uint8_t last_reflectivity = d_reflectivities_ring[last_idx];
+
+      // IDENTICAL check (same distance AND reflectivity)
+      if (raw_distance == last_raw_distance && reflectivity == last_reflectivity) {
+        return;  // Filtered: identical to last return
+      }
+
+      // Distance threshold check
+      const float last_distance = static_cast<float>(last_raw_distance) * config.dis_unit;
+      if (fabsf(distance - last_distance) < threshold) {
+        return;  // Filtered: too close to last return
+      }
+    } else {
+      // Triple-return or more (rare) - use loop
+      for (uint32_t other_ret = 0; other_ret < n_returns; ++other_ret) {
+        if (other_ret == return_id) continue;
+
+        const uint16_t other_raw_distance = d_distances_ring[group_base + other_ret];
+        const uint8_t other_reflectivity = d_reflectivities_ring[group_base + other_ret];
+
+        // IDENTICAL check
+        if (raw_distance == other_raw_distance && reflectivity == other_reflectivity) {
+          return;  // Filtered
+        }
+
+        // Distance threshold check
+        const float other_distance = static_cast<float>(other_raw_distance) * config.dis_unit;
+        if (fabsf(distance - other_distance) < threshold) {
+          return;  // Filtered
+        }
+      }
+    }
+  }
+
+compute_coordinates:
 
   // Compute Cartesian coordinates
   const float xy_distance = distance * angle_data.cos_elevation;
@@ -244,14 +300,17 @@ __global__ void decode_hesai_scan_batch_kernel(
   const float y = xy_distance * angle_data.cos_azimuth;
   const float z = distance * angle_data.sin_elevation;
 
-  // Atomic increment to get unique output index
-  const uint32_t output_idx = atomicAdd(output_count, 1);
+  // DETERMINISTIC OUTPUT: Write to global_tid position for consistent ordering
+  // This ensures reproducible results regardless of thread scheduling
+  // Invalid/filtered points will have distance=0 (from memset before kernel)
+  // A separate compaction pass will pack valid points contiguously
 
-  // Bounds check for output buffer
-  if (output_idx >= 262144) return;  // Typical max_scan_buffer_points
+  // Bounds check for output buffer (use global_tid as index)
+  // max_output_points is set to sparse_buffer_size (n_entries * n_channels * max_returns)
+  if (global_tid >= config.max_output_points) return;
 
-  // Write output point
-  CudaNebulaPoint & out_pt = output_points[output_idx];
+  // Write output point to deterministic position
+  CudaNebulaPoint & out_pt = output_points[global_tid];
   out_pt.x = x;
   out_pt.y = y;
   out_pt.z = z;
@@ -263,6 +322,9 @@ __global__ void decode_hesai_scan_batch_kernel(
   out_pt.channel = static_cast<uint16_t>(channel_id);
   out_pt.in_current_scan = in_current_scan;
   out_pt.entry_id = packet_id;  // Store block group ID for batched processing
+
+  // Increment count atomically (for total valid point count)
+  atomicAdd(output_count, 1);
 }
 
 // Constructor
@@ -447,5 +509,236 @@ extern "C" void launch_decode_hesai_scan_batch(
   cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess) {
     fprintf(stderr, "CUDA batched kernel launch failed: %s\n", cudaGetErrorString(err));
+  }
+
+  // COMPACTION PASS: Pack valid points (distance > 0) contiguously
+  // This is done on CPU side after D2H copy in hesai_decoder.hpp
+  // The kernel outputs sparse data, CPU compacts while copying to point cloud
+}
+
+// =============================================================================
+// COMPACTION KERNEL: Pack sparse point buffer into contiguous output
+// Used after batched decode to remove gaps from deterministic indexing
+// =============================================================================
+
+/// @brief Kernel to compact sparse point buffer - counts and compacts valid points
+/// Points with distance == 0 are considered invalid/filtered
+__global__ void compact_points_kernel(
+    const nebula::drivers::cuda::CudaNebulaPoint* __restrict__ d_input,
+    nebula::drivers::cuda::CudaNebulaPoint* __restrict__ d_output,
+    uint32_t* __restrict__ d_output_count,
+    const uint32_t input_size)
+{
+  const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= input_size) return;
+
+  const nebula::drivers::cuda::CudaNebulaPoint& pt = d_input[idx];
+
+  // Check if point is valid (distance > 0)
+  if (pt.distance > 0.0f) {
+    // Atomically allocate output slot
+    const uint32_t out_idx = atomicAdd(d_output_count, 1);
+    d_output[out_idx] = pt;
+  }
+}
+
+/// @brief Launch compaction kernel to pack sparse points
+/// @param d_sparse_input Sparse input buffer (from batched decode)
+/// @param d_compact_output Compacted output buffer
+/// @param d_output_count Output count (reset before call)
+/// @param input_size Number of potential points (total_work from batched kernel)
+/// @param stream CUDA stream
+extern "C" void launch_compact_points(
+    const nebula::drivers::cuda::CudaNebulaPoint* d_sparse_input,
+    nebula::drivers::cuda::CudaNebulaPoint* d_compact_output,
+    uint32_t* d_output_count,
+    uint32_t input_size,
+    cudaStream_t stream)
+{
+  const uint32_t threads_per_block = 256;
+  const uint32_t n_blocks = (input_size + threads_per_block - 1) / threads_per_block;
+
+  compact_points_kernel<<<n_blocks, threads_per_block, 0, stream>>>(
+      d_sparse_input, d_compact_output, d_output_count, input_size);
+
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    fprintf(stderr, "CUDA compact kernel launch failed: %s\n", cudaGetErrorString(err));
+  }
+}
+
+// =============================================================================
+// FORMAT CONVERSION KERNEL FOR CUDA_BLACKBOARD INTEGRATION
+// Converts CudaNebulaPoint[] to PointCloud2-compatible byte layout (PointXYZIRCAEDT)
+// =============================================================================
+
+namespace nebula::drivers::cuda
+{
+
+// PointXYZIRCAEDT field offsets (32 bytes total)
+constexpr uint32_t PC2_OFFSET_X = 0;
+constexpr uint32_t PC2_OFFSET_Y = 4;
+constexpr uint32_t PC2_OFFSET_Z = 8;
+constexpr uint32_t PC2_OFFSET_INTENSITY = 12;
+constexpr uint32_t PC2_OFFSET_RETURN_TYPE = 13;
+constexpr uint32_t PC2_OFFSET_CHANNEL = 14;
+constexpr uint32_t PC2_OFFSET_AZIMUTH = 16;
+constexpr uint32_t PC2_OFFSET_ELEVATION = 20;
+constexpr uint32_t PC2_OFFSET_DISTANCE = 24;
+constexpr uint32_t PC2_OFFSET_TIME_STAMP = 28;
+constexpr uint32_t PC2_POINT_STEP = 32;
+
+/// @brief CUDA kernel to convert CudaNebulaPoint array to PointCloud2 byte format
+/// This kernel:
+/// 1. Filters points based on in_current_scan flag
+/// 2. Converts float intensity to uint8_t
+/// 3. Reorders fields to match PointXYZIRCAEDT layout
+/// 4. Computes time_stamp (placeholder - set to 0, computed on CPU or passed in)
+///
+/// @param d_input Input CudaNebulaPoint array from decoder
+/// @param d_output Output byte buffer for PointCloud2 data
+/// @param d_output_count Atomic counter for output points (for compaction)
+/// @param input_count Number of input points
+/// @param filter_current_scan If true, only include points with in_current_scan=1
+__global__ void convert_to_pointcloud2_kernel(
+    const CudaNebulaPoint* __restrict__ d_input,
+    uint8_t* __restrict__ d_output,
+    uint32_t* __restrict__ d_output_count,
+    const uint32_t input_count,
+    const bool filter_current_scan)
+{
+  const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= input_count) return;
+
+  const CudaNebulaPoint& pt = d_input[idx];
+
+  // Filter points not in current scan (if filtering enabled)
+  if (filter_current_scan && !pt.in_current_scan) {
+    return;
+  }
+
+  // Atomically allocate output slot
+  const uint32_t out_idx = atomicAdd(d_output_count, 1);
+  uint8_t* out = d_output + out_idx * PC2_POINT_STEP;
+
+  // Write fields in PointXYZIRCAEDT order
+  *reinterpret_cast<float*>(out + PC2_OFFSET_X) = pt.x;
+  *reinterpret_cast<float*>(out + PC2_OFFSET_Y) = pt.y;
+  *reinterpret_cast<float*>(out + PC2_OFFSET_Z) = pt.z;
+
+  // Convert float intensity to uint8_t with clamping
+  out[PC2_OFFSET_INTENSITY] = static_cast<uint8_t>(
+      fminf(fmaxf(pt.intensity, 0.0f), 255.0f));
+
+  out[PC2_OFFSET_RETURN_TYPE] = pt.return_type;
+  *reinterpret_cast<uint16_t*>(out + PC2_OFFSET_CHANNEL) = pt.channel;
+  *reinterpret_cast<float*>(out + PC2_OFFSET_AZIMUTH) = pt.azimuth;
+  *reinterpret_cast<float*>(out + PC2_OFFSET_ELEVATION) = pt.elevation;
+  *reinterpret_cast<float*>(out + PC2_OFFSET_DISTANCE) = pt.distance;
+
+  // Time stamp: set to 0 for now (can be computed if packet timestamps are available)
+  // For full accuracy, this would need per-point timestamp data from the decoder
+  *reinterpret_cast<uint32_t*>(out + PC2_OFFSET_TIME_STAMP) = 0;
+}
+
+/// @brief Alternative kernel that preserves point order (no compaction)
+/// Faster but requires pre-filtering or post-processing to remove invalid points
+__global__ void convert_to_pointcloud2_ordered_kernel(
+    const CudaNebulaPoint* __restrict__ d_input,
+    uint8_t* __restrict__ d_output,
+    uint8_t* __restrict__ d_valid_mask,  // Optional: 1 if valid, 0 if filtered
+    const uint32_t input_count,
+    const bool filter_current_scan)
+{
+  const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= input_count) return;
+
+  const CudaNebulaPoint& pt = d_input[idx];
+  uint8_t* out = d_output + idx * PC2_POINT_STEP;
+
+  // Check validity
+  bool valid = !filter_current_scan || pt.in_current_scan;
+
+  if (d_valid_mask) {
+    d_valid_mask[idx] = valid ? 1 : 0;
+  }
+
+  if (!valid) {
+    // Zero out the point (or could skip writing)
+    memset(out, 0, PC2_POINT_STEP);
+    return;
+  }
+
+  // Write fields in PointXYZIRCAEDT order
+  *reinterpret_cast<float*>(out + PC2_OFFSET_X) = pt.x;
+  *reinterpret_cast<float*>(out + PC2_OFFSET_Y) = pt.y;
+  *reinterpret_cast<float*>(out + PC2_OFFSET_Z) = pt.z;
+  out[PC2_OFFSET_INTENSITY] = static_cast<uint8_t>(
+      fminf(fmaxf(pt.intensity, 0.0f), 255.0f));
+  out[PC2_OFFSET_RETURN_TYPE] = pt.return_type;
+  *reinterpret_cast<uint16_t*>(out + PC2_OFFSET_CHANNEL) = pt.channel;
+  *reinterpret_cast<float*>(out + PC2_OFFSET_AZIMUTH) = pt.azimuth;
+  *reinterpret_cast<float*>(out + PC2_OFFSET_ELEVATION) = pt.elevation;
+  *reinterpret_cast<float*>(out + PC2_OFFSET_DISTANCE) = pt.distance;
+  *reinterpret_cast<uint32_t*>(out + PC2_OFFSET_TIME_STAMP) = 0;
+}
+
+}  // namespace nebula::drivers::cuda
+
+// C-linkage wrapper for format conversion kernel
+extern "C" void launch_convert_to_pointcloud2(
+    const nebula::drivers::cuda::CudaNebulaPoint* d_input,
+    uint8_t* d_output,
+    uint32_t* d_output_count,
+    uint32_t input_count,
+    bool filter_current_scan,
+    cudaStream_t stream)
+{
+  if (input_count == 0) return;
+
+  // Reset output count
+  cudaMemsetAsync(d_output_count, 0, sizeof(uint32_t), stream);
+
+  // Launch conversion kernel
+  const uint32_t threads_per_block = 256;
+  const uint32_t n_blocks = (input_count + threads_per_block - 1) / threads_per_block;
+
+  nebula::drivers::cuda::convert_to_pointcloud2_kernel<<<n_blocks, threads_per_block, 0, stream>>>(
+      d_input,
+      d_output,
+      d_output_count,
+      input_count,
+      filter_current_scan);
+
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    fprintf(stderr, "CUDA convert_to_pointcloud2 kernel failed: %s\n", cudaGetErrorString(err));
+  }
+}
+
+// C-linkage wrapper for ordered conversion (no compaction)
+extern "C" void launch_convert_to_pointcloud2_ordered(
+    const nebula::drivers::cuda::CudaNebulaPoint* d_input,
+    uint8_t* d_output,
+    uint8_t* d_valid_mask,
+    uint32_t input_count,
+    bool filter_current_scan,
+    cudaStream_t stream)
+{
+  if (input_count == 0) return;
+
+  const uint32_t threads_per_block = 256;
+  const uint32_t n_blocks = (input_count + threads_per_block - 1) / threads_per_block;
+
+  nebula::drivers::cuda::convert_to_pointcloud2_ordered_kernel<<<n_blocks, threads_per_block, 0, stream>>>(
+      d_input,
+      d_output,
+      d_valid_mask,
+      input_count,
+      filter_current_scan);
+
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    fprintf(stderr, "CUDA convert_to_pointcloud2_ordered kernel failed: %s\n", cudaGetErrorString(err));
   }
 }
