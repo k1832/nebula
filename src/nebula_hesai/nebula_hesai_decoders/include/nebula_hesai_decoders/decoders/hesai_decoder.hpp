@@ -207,6 +207,22 @@ private:
   bool use_scan_batching_ = true;  // Batched kernel with deterministic ordering
 
   static constexpr uint32_t MAX_PACKETS_PER_SCAN = 4000;
+
+  // CUDA event timing for performance instrumentation
+  cudaEvent_t timing_event_start_ = nullptr;
+  cudaEvent_t timing_event_after_h2d_ = nullptr;
+  cudaEvent_t timing_event_after_kernel_ = nullptr;
+  cudaEvent_t timing_event_after_d2h_ = nullptr;
+  bool timing_events_initialized_ = false;
+
+  // Accumulated timing statistics (in milliseconds)
+  struct GpuTimingStats {
+    double total_h2d_ms = 0.0;
+    double total_kernel_ms = 0.0;
+    double total_d2h_ms = 0.0;
+    uint32_t flush_count = 0;
+  };
+  GpuTimingStats gpu_timing_stats_;
 #endif
 
   /// @brief Validates and parse PandarPacket. Checks size and, if present, CRC checksums.
@@ -308,6 +324,11 @@ private:
     // Sparse output buffer size for deterministic indexing (global_tid -> output position)
     config.max_output_points = n_entries * n_channels * max_returns;
 
+    // Record start event for timing instrumentation
+    if (timing_events_initialized_) {
+      cudaEventRecord(timing_event_start_, cuda_stream_);
+    }
+
     // === STEP 1: Bulk copy ALL data to GPU (ONE transfer per buffer) ===
     cudaMemcpyAsync(gpu_scan_buffer_.d_distances_ring, gpu_scan_buffer_.h_distances_staging,
                     total_data_size * sizeof(uint16_t),
@@ -326,6 +347,11 @@ private:
                     cudaMemcpyHostToDevice, cuda_stream_);
     cudaMemcpyAsync(d_config_, &config, sizeof(config),
                     cudaMemcpyHostToDevice, cuda_stream_);
+
+    // Record event after H2D copies
+    if (timing_events_initialized_) {
+      cudaEventRecord(timing_event_after_h2d_, cuda_stream_);
+    }
 
     // === STEP 2: Reset output counter and ZERO output buffer ===
     // Zeroing the output buffer is critical for deterministic indexing:
@@ -352,6 +378,11 @@ private:
       n_entries,
       cuda_stream_);
 
+    // Record event after kernel launch
+    if (timing_events_initialized_) {
+      cudaEventRecord(timing_event_after_kernel_, cuda_stream_);
+    }
+
     // === STEP 4: Synchronize ONCE ===
     cudaStreamSynchronize(cuda_stream_);
 
@@ -360,6 +391,31 @@ private:
     // The count tells us how many valid points exist, but they're not contiguous
     uint32_t valid_point_count = 0;
     cudaMemcpy(&valid_point_count, d_count_, sizeof(uint32_t), cudaMemcpyDeviceToHost);
+
+    // Record event after D2H copy (count retrieval) and compute timing
+    if (timing_events_initialized_) {
+      cudaEventRecord(timing_event_after_d2h_, cuda_stream_);
+      cudaEventSynchronize(timing_event_after_d2h_);
+
+      float h2d_ms = 0.0f, kernel_ms = 0.0f, d2h_ms = 0.0f;
+      cudaEventElapsedTime(&h2d_ms, timing_event_start_, timing_event_after_h2d_);
+      cudaEventElapsedTime(&kernel_ms, timing_event_after_h2d_, timing_event_after_kernel_);
+      cudaEventElapsedTime(&d2h_ms, timing_event_after_kernel_, timing_event_after_d2h_);
+
+      // Accumulate stats
+      gpu_timing_stats_.total_h2d_ms += h2d_ms;
+      gpu_timing_stats_.total_kernel_ms += kernel_ms;
+      gpu_timing_stats_.total_d2h_ms += d2h_ms;
+      gpu_timing_stats_.flush_count++;
+
+      // Log per-flush timing (throttled to avoid log spam)
+      if (gpu_timing_stats_.flush_count <= 10 || gpu_timing_stats_.flush_count % 100 == 0) {
+        NEBULA_LOG_STREAM(logger_->info, "[GPU_TIMING] flush#" << gpu_timing_stats_.flush_count
+          << " entries=" << n_entries << " points=" << valid_point_count
+          << " h2d=" << h2d_ms << "ms kernel=" << kernel_ms << "ms d2h=" << d2h_ms
+          << "ms total=" << (h2d_ms + kernel_ms + d2h_ms) << "ms");
+      }
+    }
 
     // Calculate total sparse buffer size (all potential point positions)
     const uint32_t sparse_buffer_size = n_entries * n_channels * max_returns;
@@ -1187,6 +1243,34 @@ public:
     cuda_enabled_ = true;
     NEBULA_LOG_STREAM(logger_->info, "CUDA decoder initialized successfully with "
       << n_channels << " channels and " << cuda_n_azimuths_ << " azimuth divisions");
+
+    // Initialize CUDA events for timing instrumentation
+    cudaError_t event_err = cudaEventCreate(&timing_event_start_);
+    if (event_err == cudaSuccess) {
+      event_err = cudaEventCreate(&timing_event_after_h2d_);
+    }
+    if (event_err == cudaSuccess) {
+      event_err = cudaEventCreate(&timing_event_after_kernel_);
+    }
+    if (event_err == cudaSuccess) {
+      event_err = cudaEventCreate(&timing_event_after_d2h_);
+    }
+    if (event_err == cudaSuccess) {
+      timing_events_initialized_ = true;
+      NEBULA_LOG_STREAM(logger_->info, "CUDA timing events initialized");
+    } else {
+      NEBULA_LOG_STREAM(logger_->warn, "Failed to initialize CUDA timing events: "
+        << cudaGetErrorString(event_err));
+      // Clean up any partially created events
+      if (timing_event_start_) cudaEventDestroy(timing_event_start_);
+      if (timing_event_after_h2d_) cudaEventDestroy(timing_event_after_h2d_);
+      if (timing_event_after_kernel_) cudaEventDestroy(timing_event_after_kernel_);
+      if (timing_event_after_d2h_) cudaEventDestroy(timing_event_after_d2h_);
+      timing_event_start_ = nullptr;
+      timing_event_after_h2d_ = nullptr;
+      timing_event_after_kernel_ = nullptr;
+      timing_event_after_d2h_ = nullptr;
+    }
   }
 
   /// @brief Cleanup CUDA resources
@@ -1215,6 +1299,29 @@ public:
     }
     if (cuda_stream_) {
       cudaStreamDestroy(cuda_stream_);
+    }
+    // Clean up timing events
+    if (timing_event_start_) {
+      cudaEventDestroy(timing_event_start_);
+    }
+    if (timing_event_after_h2d_) {
+      cudaEventDestroy(timing_event_after_h2d_);
+    }
+    if (timing_event_after_kernel_) {
+      cudaEventDestroy(timing_event_after_kernel_);
+    }
+    if (timing_event_after_d2h_) {
+      cudaEventDestroy(timing_event_after_d2h_);
+    }
+    // Log accumulated timing stats if any measurements were taken
+    if (gpu_timing_stats_.flush_count > 0) {
+      double avg_h2d = gpu_timing_stats_.total_h2d_ms / gpu_timing_stats_.flush_count;
+      double avg_kernel = gpu_timing_stats_.total_kernel_ms / gpu_timing_stats_.flush_count;
+      double avg_d2h = gpu_timing_stats_.total_d2h_ms / gpu_timing_stats_.flush_count;
+      double avg_total = avg_h2d + avg_kernel + avg_d2h;
+      NEBULA_LOG_STREAM(logger_->info, "[GPU_TIMING_SUMMARY] flushes=" << gpu_timing_stats_.flush_count
+        << " avg_h2d=" << avg_h2d << "ms avg_kernel=" << avg_kernel << "ms avg_d2h=" << avg_d2h
+        << "ms avg_total=" << avg_total << "ms");
     }
   }
 

@@ -200,15 +200,25 @@ void HesaiDecoderWrapper::on_pointcloud_decoded(
 
 #if defined(CUDA_BLACKBOARD_AVAILABLE) && defined(NEBULA_CUDA_ENABLED)
   // GPU PIPELINE PATH: Publish via cuda_blackboard for zero-copy downstream processing
-  if (sensor_cfg_->gpu_pipeline_mode && cuda_points_pub_) {
-    std::lock_guard lock(mtx_driver_ptr_);
-    if (driver_ptr_) {
-      auto gpu_cloud = driver_ptr_->get_gpu_pointcloud();
-      if (gpu_cloud.valid) {
-        publish_cuda_pointcloud(gpu_cloud, timestamp_s);
+  if (sensor_cfg_->gpu_pipeline_mode) {
+    if (!cuda_points_pub_) {
+      RCLCPP_INFO_ONCE(logger_, "[CUDA_PATH] cuda_points_pub_ is NULL - cannot publish");
+    } else {
+      std::lock_guard lock(mtx_driver_ptr_);
+      if (driver_ptr_) {
+        auto gpu_cloud = driver_ptr_->get_gpu_pointcloud();
+        RCLCPP_INFO_THROTTLE(logger_, *parent_node_.get_clock(), 1000,
+          "[CUDA_PATH] get_gpu_pointcloud returned: valid=%s, count=%u",
+          gpu_cloud.valid ? "true" : "false", gpu_cloud.point_count);
+        if (gpu_cloud.valid) {
+          publish_cuda_pointcloud(gpu_cloud, timestamp_s);
+        }
       }
     }
   }
+#else
+  (void)timestamp_s;  // Suppress unused warning when CUDA not available
+  RCLCPP_INFO_ONCE(logger_, "[CUDA_PATH] CUDA blackboard not available - compiled without CUDA support");
 #endif
 
   // CPU PIPELINE PATH: Standard ROS2 publishing
@@ -399,7 +409,8 @@ void HesaiDecoderWrapper::initialize_cuda_pipeline()
     cuda_blackboard::CudaBlackboardPublisher<cuda_blackboard::CudaPointCloud2>>(
     parent_node_, "pandar_points_cuda");
 
-  RCLCPP_INFO(logger_, "CUDA pipeline initialized for GPU zero-copy publishing");
+  RCLCPP_INFO(logger_, "CUDA pipeline initialized successfully - cuda_points_pub_ is %s",
+              cuda_points_pub_ ? "valid" : "null");
 }
 
 void HesaiDecoderWrapper::cleanup_cuda_pipeline()
@@ -455,8 +466,15 @@ void HesaiDecoderWrapper::publish_cuda_pointcloud(
   double timestamp_s)
 {
   if (!cuda_points_pub_ || !gpu_cloud.valid || gpu_cloud.point_count == 0) {
+    RCLCPP_INFO_THROTTLE(logger_, *parent_node_.get_clock(), 1000,
+      "[CUDA_PUBLISH] Early return: pub=%s, valid=%s, count=%u",
+      cuda_points_pub_ ? "yes" : "no",
+      gpu_cloud.valid ? "yes" : "no",
+      gpu_cloud.point_count);
     return;
   }
+  RCLCPP_INFO_THROTTLE(logger_, *parent_node_.get_clock(), 1000,
+    "[CUDA_PUBLISH] Processing %u points for CUDA publication", gpu_cloud.point_count);
 
   // Ensure we have enough buffer space for PointCloud2 format (32 bytes per point)
   const size_t required_size = gpu_cloud.point_count * drivers::cuda::POINTCLOUD2_POINT_STEP;
