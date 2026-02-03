@@ -35,7 +35,7 @@ ament_target_dependencies(
   pcl_conversions)
 
 rclcpp_components_register_node(
-  robosense_ros_wrapper PLUGIN "RobosenseRosWrapper" EXECUTABLE
+  robosense_ros_wrapper PLUGIN "nebula::ros::RobosenseRosWrapper" EXECUTABLE
   robosense_ros_wrapper_node)
 
 install(

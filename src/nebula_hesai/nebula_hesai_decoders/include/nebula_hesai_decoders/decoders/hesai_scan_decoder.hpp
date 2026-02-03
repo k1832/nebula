@@ -19,6 +19,10 @@
 #include <nebula_core_common/util/expected.hpp>
 #include <nebula_hesai_common/hesai_common.hpp>
 
+#ifdef NEBULA_CUDA_ENABLED
+#include <nebula_hesai_decoders/cuda/hesai_cuda_decoder.hpp>
+#endif
+
 #include <cstdint>
 #include <vector>
 
@@ -77,6 +81,21 @@ public:
   virtual PacketDecodeResult unpack(const std::vector<uint8_t> & packet) = 0;
 
   virtual void set_pointcloud_callback(pointcloud_callback_t callback) = 0;
+
+#ifdef NEBULA_CUDA_ENABLED
+  /// @brief Get GPU point cloud for zero-copy downstream processing
+  /// Only valid when gpu_pipeline_mode is enabled in configuration.
+  /// Default implementation returns invalid GpuPointCloud.
+  /// @return GpuPointCloud struct with device pointer, count, timestamp, and validity flag
+  virtual cuda::GpuPointCloud get_gpu_pointcloud() const
+  {
+    return cuda::GpuPointCloud{};  // Invalid by default
+  }
+
+  /// @brief Check if GPU pipeline mode is active
+  /// @return true if CUDA is enabled and gpu_pipeline_mode is configured
+  virtual bool is_gpu_pipeline_mode() const { return false; }
+#endif
 };
 }  // namespace nebula::drivers
 

@@ -315,6 +315,10 @@ nebula::Status HesaiRosWrapper::declare_and_get_sensor_config_params()
     }
   }
 
+  // GPU pipeline mode: keeps decoded points on GPU for zero-copy downstream processing
+  // Only effective when built with NEBULA_CUDA_ENABLED
+  config.gpu_pipeline_mode = declare_parameter<bool>("gpu_pipeline_mode", false, param_read_only());
+
   auto new_cfg_ptr = std::make_shared<const nebula::drivers::HesaiSensorConfiguration>(config);
   return validate_and_set_config(new_cfg_ptr);
 }
@@ -682,5 +686,6 @@ HesaiRosWrapper::get_calibration_result_t HesaiRosWrapper::get_calibration_data(
   return calib;
 }
 
-RCLCPP_COMPONENTS_REGISTER_NODE(HesaiRosWrapper)
 }  // namespace nebula::ros
+
+RCLCPP_COMPONENTS_REGISTER_NODE(nebula::ros::HesaiRosWrapper)

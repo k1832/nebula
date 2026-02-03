@@ -24,6 +24,10 @@
 #include "nebula_hesai_decoders/decoders/hesai_scan_decoder.hpp"
 #include "nebula_hesai_decoders/decoders/packet_loss_detector.hpp"
 
+#ifdef NEBULA_CUDA_ENABLED
+#include "nebula_hesai_decoders/cuda/hesai_cuda_decoder.hpp"
+#endif
+
 #include <nebula_core_common/loggers/logger.hpp>
 
 #include <cstdint>
@@ -139,6 +143,22 @@ public:
   /// @return Metadata on success, or decode error on failure. Performance counters are always
   /// returned.
   PacketDecodeResult parse_cloud_packet(const std::vector<uint8_t> & packet);
+
+#ifdef NEBULA_CUDA_ENABLED
+  /// @brief Get GPU point cloud data (zero-copy access to device memory)
+  /// @return GpuPointCloud structure with device pointer and metadata
+  cuda::GpuPointCloud get_gpu_pointcloud() const
+  {
+    return scan_decoder_ ? scan_decoder_->get_gpu_pointcloud() : cuda::GpuPointCloud{};
+  }
+
+  /// @brief Check if GPU pipeline mode is active
+  /// @return true if GPU pipeline mode is enabled and CUDA is available
+  bool is_gpu_pipeline_mode() const
+  {
+    return scan_decoder_ ? scan_decoder_->is_gpu_pipeline_mode() : false;
+  }
+#endif
 };
 
 }  // namespace nebula::drivers

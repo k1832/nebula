@@ -35,6 +35,13 @@
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 
+// CUDA blackboard for zero-copy GPU pipeline
+#if defined(CUDA_BLACKBOARD_AVAILABLE) && defined(NEBULA_CUDA_ENABLED)
+#include <cuda_blackboard/cuda_blackboard_publisher.hpp>
+#include <cuda_blackboard/cuda_pointcloud2.hpp>
+#include <nebula_hesai_decoders/cuda/hesai_cuda_decoder.hpp>
+#endif
+
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -165,5 +172,35 @@ private:
     uint64_t receive_time_current_scan_ns{0};
     uint64_t publish_time_current_scan_ns{0};
   } current_scan_perf_counters_;
+
+#if defined(CUDA_BLACKBOARD_AVAILABLE) && defined(NEBULA_CUDA_ENABLED)
+  /// @brief CUDA blackboard publisher for zero-copy GPU pipeline
+  std::unique_ptr<cuda_blackboard::CudaBlackboardPublisher<cuda_blackboard::CudaPointCloud2>>
+    cuda_points_pub_;
+
+  /// @brief CUDA stream for format conversion
+  cudaStream_t cuda_conversion_stream_ = nullptr;
+
+  /// @brief Device buffer for PointCloud2 format output
+  uint8_t* d_pointcloud2_buffer_ = nullptr;
+  size_t pointcloud2_buffer_size_ = 0;
+
+  /// @brief Device counter for output points
+  uint32_t* d_output_count_ = nullptr;
+
+  /// @brief Initialize CUDA resources for GPU pipeline
+  void initialize_cuda_pipeline();
+
+  /// @brief Cleanup CUDA resources
+  void cleanup_cuda_pipeline();
+
+  /// @brief Publish point cloud via cuda_blackboard (GPU zero-copy path)
+  void publish_cuda_pointcloud(
+    const drivers::cuda::GpuPointCloud& gpu_cloud,
+    double timestamp_s);
+
+  /// @brief Create PointCloud2 field descriptors for PointXYZIRCAEDT
+  static std::vector<sensor_msgs::msg::PointField> create_xyzircaedt_fields();
+#endif
 };
 }  // namespace nebula::ros

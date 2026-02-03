@@ -264,5 +264,6 @@ void VelodyneRosWrapper::receive_cloud_packet_callback(const std::vector<uint8_t
   decoder_wrapper_->process_cloud_packet(std::move(msg_ptr));
 }
 
-RCLCPP_COMPONENTS_REGISTER_NODE(VelodyneRosWrapper)
 }  // namespace nebula::ros
+
+RCLCPP_COMPONENTS_REGISTER_NODE(nebula::ros::VelodyneRosWrapper)

@@ -27,7 +27,7 @@ ament_target_dependencies(velodyne_ros_wrapper PUBLIC diagnostic_msgs
                           velodyne_msgs nebula_msgs rclcpp_components)
 
 rclcpp_components_register_node(
-  velodyne_ros_wrapper PLUGIN "VelodyneRosWrapper" EXECUTABLE
+  velodyne_ros_wrapper PLUGIN "nebula::ros::VelodyneRosWrapper" EXECUTABLE
   velodyne_ros_wrapper_node)
 
 install(
