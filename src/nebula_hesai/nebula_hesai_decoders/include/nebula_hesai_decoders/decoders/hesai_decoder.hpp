@@ -78,6 +78,10 @@ private:
   uint64_t callback_time_ns_{0};
   /// @brief Whether a scan was completed during the current unpack() call (reset per packet)
   bool did_scan_complete_{false};
+  /// @brief Accumulated decode time across all packets in a scan (for CPU profiling)
+  uint64_t accumulated_decode_ns_{0};
+  /// @brief Point count of the last completed scan (for CPU profiling)
+  size_t last_completed_scan_points_{0};
   /// @brief The current block being processed (used for timestamp reset calculation)
   size_t current_block_id_{0};
 
@@ -281,6 +285,7 @@ private:
     did_scan_complete_ = true;
 
     auto & completed_frame = frame_buffers_[buffer_index];
+    last_completed_scan_points_ = completed_frame.pointcloud->size();
     constexpr uint64_t nanoseconds_per_second = 1'000'000'000ULL;
     double scan_timestamp_s =
       static_cast<double>(completed_frame.scan_timestamp_ns / nanoseconds_per_second) +
@@ -388,6 +393,14 @@ public:
     }
 
     uint64_t decode_duration_ns = decode_watch.elapsed_ns();
+    accumulated_decode_ns_ += decode_duration_ns;
+
+    if (did_scan_complete_) {
+      std::cerr << "PROFILING {\"d_cpu_unpack_ms\": " << (accumulated_decode_ns_ / 1e6)
+                << ", \"n_points\": " << last_completed_scan_points_
+                << "}" << std::endl;
+      accumulated_decode_ns_ = 0;
+    }
 
     PacketMetadata metadata;
     metadata.packet_timestamp_ns = hesai_packet::get_timestamp_ns(packet_);
