@@ -1,0 +1,79 @@
+#!/usr/bin/env bpftrace
+/*
+ * Hesai CPU Decoder Latency Profiler
+ *
+ * Traces function entry/exit times for the Hesai CPU decoder to measure
+ * unpack() and convert_returns() latencies.
+ *
+ * Usage:
+ *   sudo bpftrace hesai_cpu_latency.bt -p $(pgrep -f nebula)
+ *
+ * Prerequisites:
+ *   - Build with RelWithDebInfo for symbols: colcon build --cmake-args -DCMAKE_BUILD_TYPE=RelWithDebInfo
+ *   - Verify symbols: nm -C install/nebula_decoders/lib/libnebula_decoders_hesai.so | grep unpack
+ *
+ * Output:
+ *   - Histogram of unpack() latencies in microseconds
+ *   - Histogram of convert_returns() latencies in microseconds
+ *   - Summary statistics (count, average, total)
+ */
+
+BEGIN {
+    printf("Profiling Hesai CPU decoder...\n");
+    printf("Attach to nebula process and wait for data...\n");
+    printf("Press Ctrl-C to stop and see results.\n\n");
+}
+
+// unpack() function - main entry point for packet processing
+uprobe:/home/keitamorisaki/autoware/install/nebula_decoders/lib/libnebula_decoders_hesai.so:*HesaiDecoder*unpack* {
+    @unpack_start[tid] = nsecs;
+}
+
+uretprobe:/home/keitamorisaki/autoware/install/nebula_decoders/lib/libnebula_decoders_hesai.so:*HesaiDecoder*unpack* {
+    if (@unpack_start[tid]) {
+        $latency_us = (nsecs - @unpack_start[tid]) / 1000;
+        @unpack_hist = hist($latency_us);
+        @unpack_stats = stats($latency_us);
+        @unpack_count++;
+        delete(@unpack_start[tid]);
+    }
+}
+
+// convert_returns() function - point conversion hot path
+uprobe:/home/keitamorisaki/autoware/install/nebula_decoders/lib/libnebula_decoders_hesai.so:*HesaiDecoder*convert_returns* {
+    @convert_start[tid] = nsecs;
+}
+
+uretprobe:/home/keitamorisaki/autoware/install/nebula_decoders/lib/libnebula_decoders_hesai.so:*HesaiDecoder*convert_returns* {
+    if (@convert_start[tid]) {
+        $latency_us = (nsecs - @convert_start[tid]) / 1000;
+        @convert_hist = hist($latency_us);
+        @convert_stats = stats($latency_us);
+        @convert_count++;
+        delete(@convert_start[tid]);
+    }
+}
+
+END {
+    printf("\n");
+    printf("=".repeat(60));
+    printf("\n HESAI CPU DECODER LATENCY RESULTS\n");
+    printf("=".repeat(60));
+    printf("\n\n");
+
+    printf("--- UNPACK LATENCY (microseconds) ---\n");
+    printf("Calls: %d\n", @unpack_count);
+    print(@unpack_hist);
+    print(@unpack_stats);
+
+    printf("\n--- CONVERT_RETURNS LATENCY (microseconds) ---\n");
+    printf("Calls: %d\n", @convert_count);
+    print(@convert_hist);
+    print(@convert_stats);
+
+    // Cleanup
+    clear(@unpack_start);
+    clear(@convert_start);
+    clear(@unpack_count);
+    clear(@convert_count);
+}
