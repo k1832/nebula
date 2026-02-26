@@ -246,6 +246,32 @@ public:
 
     return false;
   }
+
+  /// @brief Get the number of frames for CUDA multi-frame support
+  /// @return Number of frames (e.g., 4 for AT128)
+  size_t get_n_frames() const { return frame_angle_info_.size(); }
+
+  /// @brief Get frame angle info for CUDA multi-frame support
+  /// @param frame_id The frame index
+  /// @param fov_start Output: FOV start angle (raw azimuth)
+  /// @param fov_end Output: FOV end angle (raw azimuth)
+  /// @param timestamp_reset Output: timestamp reset angle (raw azimuth)
+  /// @param scan_emit Output: scan emit angle (raw azimuth)
+  /// @return true if frame_id is valid
+  bool get_frame_angle_info(
+    size_t frame_id, uint32_t & fov_start, uint32_t & fov_end, uint32_t & timestamp_reset,
+    uint32_t & scan_emit) const
+  {
+    if (frame_id >= frame_angle_info_.size()) {
+      return false;
+    }
+    const auto & info = frame_angle_info_[frame_id];
+    fov_start = info.fov_start;
+    fov_end = info.fov_end;
+    timestamp_reset = info.timestamp_reset;
+    scan_emit = info.scan_emit;
+    return true;
+  }
 };
 
 }  // namespace nebula::drivers

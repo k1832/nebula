@@ -48,6 +48,18 @@ struct CudaAngleCorrectionData
   float cos_elevation;
 };
 
+/// @brief Maximum number of frames (mirrors) supported for multi-frame sensors like AT128
+static constexpr uint32_t MAX_CUDA_FRAMES = 8;
+
+/// @brief Frame angle info for multi-frame sensors (AT128 has 4 frames)
+struct CudaFrameAngleInfo
+{
+  uint32_t fov_start;        // Raw azimuth where FOV starts for this frame
+  uint32_t fov_end;          // Raw azimuth where FOV ends for this frame
+  uint32_t timestamp_reset;  // Raw azimuth where timestamp resets for this frame
+  uint32_t scan_emit;        // Raw azimuth where scan emit occurs for this frame
+};
+
 /// @brief Configuration data for CUDA decoder
 struct CudaDecoderConfig
 {
@@ -70,6 +82,16 @@ struct CudaDecoderConfig
   uint32_t emit_angle_raw;
   uint32_t n_azimuths_raw;  // Total azimuth count (e.g., 36000 for 0.01 deg resolution)
   uint32_t max_output_points;  // Maximum output buffer size for sparse indexing (batched mode)
+
+  // Azimuth scaling for sensors with different degree_subdivisions
+  // For sensors with degree_subdivisions=100: scale=1 (no scaling needed)
+  // For AT128 with degree_subdivisions=25600: scale=256 (raw_azimuth/256 = LUT index)
+  uint32_t azimuth_scale;  // Scale factor: raw_azimuth / azimuth_scale = LUT index
+
+  // Multi-frame support for sensors like AT128 (has 4 mirror frames)
+  uint32_t n_frames;  // Number of frames (1 for single-frame, 4 for AT128)
+  CudaFrameAngleInfo frame_angles[MAX_CUDA_FRAMES];  // Per-frame angle boundaries
+  bool is_multi_frame;  // True if sensor has multiple frames (uses frame_angles)
 };
 
 /// @brief GPU point cloud structure for zero-copy pipeline
@@ -156,7 +178,7 @@ void launch_decode_hesai_packet(
     const uint16_t* d_distances,
     const uint8_t* d_reflectivities,
     const nebula::drivers::cuda::CudaAngleCorrectionData* d_angle_lut,
-    const nebula::drivers::cuda::CudaDecoderConfig* d_config,
+    const nebula::drivers::cuda::CudaDecoderConfig& config,
     nebula::drivers::cuda::CudaNebulaPoint* d_points,
     uint32_t* d_count,
     uint32_t n_azimuths,
@@ -165,13 +187,13 @@ void launch_decode_hesai_packet(
 
 /// @brief Launch batched kernel to decode entire scan
 void launch_decode_hesai_scan_batch(
-    const uint16_t* d_distances_ring,
-    const uint8_t* d_reflectivities_ring,
+    const uint16_t* d_distances_batch,
+    const uint8_t* d_reflectivities_batch,
     const uint32_t* d_raw_azimuths,
     const uint32_t* d_n_returns,
     const uint32_t* d_last_azimuths,
     const nebula::drivers::cuda::CudaAngleCorrectionData* d_angle_lut,
-    const nebula::drivers::cuda::CudaDecoderConfig* d_config,
+    const nebula::drivers::cuda::CudaDecoderConfig& config,
     nebula::drivers::cuda::CudaNebulaPoint* d_points,
     uint32_t* d_count,
     uint32_t n_azimuths,

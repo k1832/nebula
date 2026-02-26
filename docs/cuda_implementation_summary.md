@@ -1,7 +1,7 @@
 # CUDA Scan-Level Batching Implementation Summary
 
-**Date**: 2026-01-28
-**Status**: Complete (17/18 tests passing)
+**Date**: 2026-02-04
+**Status**: Complete (17/18 tests passing, AT128 multi-frame support added)
 
 ## Executive Summary
 
@@ -180,8 +180,8 @@ void convert_returns(size_t start_block_id, size_t n_blocks)
 
 ```cpp
 __global__ void decode_hesai_scan_batch_kernel(
-    const uint16_t* __restrict__ d_distances_ring,
-    const uint8_t* __restrict__ d_reflectivities_ring,
+    const uint16_t* __restrict__ d_distances_batch,
+    const uint8_t* __restrict__ d_reflectivities_batch,
     const uint32_t* __restrict__ d_raw_azimuths,
     const uint32_t* __restrict__ d_n_returns,
     const uint32_t* __restrict__ d_last_azimuths,
@@ -208,8 +208,8 @@ __global__ void decode_hesai_scan_batch_kernel(
   // Load data
   const uint32_t data_idx = packet_id * (config.n_channels * config.max_returns)
                            + channel_id * config.max_returns + return_id;
-  const uint16_t raw_distance = d_distances_ring[data_idx];
-  const uint8_t reflectivity = d_reflectivities_ring[data_idx];
+  const uint16_t raw_distance = d_distances_batch[data_idx];
+  const uint8_t reflectivity = d_reflectivities_batch[data_idx];
 
   // Distance validation (same as CPU)
   if (raw_distance == 0) return;
@@ -252,8 +252,8 @@ __global__ void decode_hesai_scan_batch_kernel(
 
     if (n_returns == 2) {
       // Optimized path for dual-return (most common)
-      const uint16_t last_raw_distance = d_distances_ring[group_base + 1];
-      const uint8_t last_reflectivity = d_reflectivities_ring[group_base + 1];
+      const uint16_t last_raw_distance = d_distances_batch[group_base + 1];
+      const uint8_t last_reflectivity = d_reflectivities_batch[group_base + 1];
 
       // IDENTICAL check
       if (raw_distance == last_raw_distance && reflectivity == last_reflectivity) return;
@@ -265,8 +265,8 @@ __global__ void decode_hesai_scan_batch_kernel(
       // General case for triple-return or higher
       for (uint32_t other_ret = 0; other_ret < n_returns; ++other_ret) {
         if (other_ret == return_id) continue;
-        const uint16_t other_raw = d_distances_ring[group_base + other_ret];
-        const uint8_t other_refl = d_reflectivities_ring[group_base + other_ret];
+        const uint16_t other_raw = d_distances_batch[group_base + other_ret];
+        const uint8_t other_refl = d_reflectivities_batch[group_base + other_ret];
         if (raw_distance == other_raw && reflectivity == other_refl) return;
         const float other_dist = static_cast<float>(other_raw) * config.dis_unit;
         if (fabsf(distance - other_dist) < config.dual_return_distance_threshold) return;
@@ -305,7 +305,7 @@ __global__ void decode_hesai_scan_batch_kernel(
 | Aspect | CPU | GPU |
 |--------|-----|-----|
 | **Parallelism** | Sequential (1 thread) | Parallel (~1M threads per scan) |
-| **Memory Access** | Random (packet structure) | Coalesced (ring buffers) |
+| **Memory Access** | Random (packet structure) | Coalesced (batch buffers) |
 | **Angle Correction** | On-demand computation | Pre-computed LUT (36000 × 128 entries) |
 | **Trigonometry** | CPU sin/cos calls | Pre-computed sin/cos stored in LUT |
 | **Dual-Return Filter** | Generic loop | Special-cased for dual-return mode |
@@ -416,9 +416,9 @@ Holds accumulated packet data for batch processing:
 
 ```cpp
 struct GpuScanBuffer {
-  // Device ring buffers (GPU memory)
-  uint16_t* d_distances_ring;      // [MAX_PACKETS][n_channels * max_returns]
-  uint8_t* d_reflectivities_ring;
+  // Device batch buffers (GPU memory)
+  uint16_t* d_distances_batch;      // [MAX_PACKETS][n_channels * max_returns]
+  uint8_t* d_reflectivities_batch;
   uint32_t* d_raw_azimuths;        // [MAX_PACKETS]
   uint32_t* d_n_returns;
   uint32_t* d_last_azimuths;       // For GPU overlap detection
@@ -558,12 +558,18 @@ struct CudaAngleCorrectionData {
 
 ### Supported Sensors
 
-CUDA batching is only supported for **calibration-based sensors**:
+CUDA batching is supported for both **calibration-based** and **correction-based** sensors:
+
+**Calibration-based (single-frame):**
 - Pandar64, Pandar40P, PandarQT64, PandarQT128
 - Pandar128E3X, Pandar128E4X
-- PandarXT16, PandarXT32
+- PandarXT16, PandarXT32, PandarXT32M
 
-**Not supported**: AT128 (correction-based angles would require enormous LUTs)
+**Correction-based (multi-frame):**
+- PandarAT128 (4 mirror frames, ~110 MB GPU memory for LUT)
+
+Multi-frame sensors like AT128 require per-frame angle boundary handling in the GPU kernel.
+The angle LUT is pre-computed on CPU and uploaded to GPU at initialization.
 
 ---
 
@@ -584,9 +590,15 @@ gpu_pipeline_mode: true
 ### Build with CUDA Support
 
 ```bash
-colcon build --symlink-install --cmake-args \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DNEBULA_CUDA_ENABLED=ON \
+# Production build (no profiling overhead)
+colcon build --symlink-install --packages-up-to nebula_hesai \
+  --cmake-args -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_ARCHITECTURES=89
+
+# Benchmark build (with profiling instrumentation)
+colcon build --symlink-install --packages-up-to nebula_hesai \
+  --cmake-args -DCMAKE_BUILD_TYPE=Release \
+  -DNEBULA_CUDA_PROFILING=ON \
   -DCMAKE_CUDA_ARCHITECTURES=89
 ```
 
@@ -629,3 +641,32 @@ The CUDA implementation offloads point cloud decoding from CPU to GPU while main
 | **Test Status** | 18/18 passing | 17/18 passing |
 
 The implementation enables GPU-native point cloud pipelines for autonomous driving perception stacks while preserving compatibility with existing CPU workflows.
+
+---
+
+## CUDA Kernel Branching Analysis
+
+The batched kernel (`decode_hesai_scan_batch_kernel`) contains several branches. These are intentional and follow GPU best practices:
+
+### Uniform Branches (zero divergence cost)
+- **`config.is_multi_frame`**: Every thread in a warp evaluates identically since this is a per-scan constant. The compiler may optimize this to a compile-time branch.
+- **`n_returns == 2`**: All threads processing the same packet see the same value. Dual-return is the most common mode, so this special case avoids loop overhead.
+
+### Early-Exit Branches (standard GPU optimization)
+- **`raw_distance == 0`**: Skips invalid points. Computing coordinates then discarding would be strictly worse — the ALU savings from early exit outweigh any minor divergence.
+- **Range check** (`distance < min_range || distance > max_range`): Same rationale as above.
+- **FOV check** (`!in_fov`): Filters ~0% to ~50% of points depending on configured FOV. Early exit saves all downstream computation.
+
+### Data-Dependent Branches (unavoidable logic)
+- **Overlap detection** (~5% of points): Points near scan boundaries need scan assignment. This affects a small fraction of threads in a warp, and the branch is necessary for correctness.
+- **Dual-return filtering**: Compares distances between returns. Only affects non-last returns, and the branch body is lightweight (a few memory loads + comparison).
+
+**Removing these branches would be counterproductive.** The early exits save significant ALU work, and the uniform branches have zero divergence cost. The data-dependent branches affect small fractions of threads and are unavoidable for correctness.
+
+---
+
+## Related Documentation
+
+- [AT128 CUDA Validation](at128_cuda_validation.md) - Multi-frame sensor validation tracking
+- [Hesai Decoder Design](hesai_decoder_design.md) - Overall decoder architecture
+- [Benchmarking Guide](contributing/benchmarking.md) - Performance measurement tools

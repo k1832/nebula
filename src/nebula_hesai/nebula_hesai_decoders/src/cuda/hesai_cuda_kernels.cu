@@ -49,7 +49,7 @@ __device__ __forceinline__ bool cuda_angle_is_between_raw(
   }
 }
 
-// Device function: Check if we're inside the overlap region
+// Device function: Check if we're inside the overlap region (single-frame version)
 // Overlap is the region between timestamp_reset_angle and emit_angle
 __device__ __forceinline__ bool cuda_is_inside_overlap(
   uint32_t last_azimuth, uint32_t current_azimuth,
@@ -57,6 +57,40 @@ __device__ __forceinline__ bool cuda_is_inside_overlap(
 {
   return cuda_angle_is_between_raw(timestamp_reset_angle, emit_angle, current_azimuth, max_angle) ||
          cuda_angle_is_between_raw(timestamp_reset_angle, emit_angle, last_azimuth, max_angle);
+}
+
+// Device function: Check if we're inside the overlap region for multi-frame sensors (AT128)
+// Iterates over all frames and returns true if inside overlap for any frame
+__device__ __forceinline__ bool cuda_is_inside_overlap_multiframe(
+  uint32_t last_azimuth, uint32_t current_azimuth,
+  const CudaFrameAngleInfo* frame_angles, uint32_t n_frames, uint32_t max_angle)
+{
+  for (uint32_t i = 0; i < n_frames; ++i) {
+    if (cuda_angle_is_between_raw(frame_angles[i].timestamp_reset, frame_angles[i].scan_emit,
+                                  current_azimuth, max_angle) ||
+        cuda_angle_is_between_raw(frame_angles[i].timestamp_reset, frame_angles[i].scan_emit,
+                                  last_azimuth, max_angle)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Device function: Check if azimuth is inside FOV for multi-frame sensors (AT128)
+// Returns true if inside FOV for any frame
+__device__ __forceinline__ bool cuda_is_inside_fov_multiframe(
+  uint32_t last_azimuth, uint32_t current_azimuth,
+  const CudaFrameAngleInfo* frame_angles, uint32_t n_frames, uint32_t max_angle)
+{
+  for (uint32_t i = 0; i < n_frames; ++i) {
+    if (cuda_angle_is_between_raw(frame_angles[i].fov_start, frame_angles[i].fov_end,
+                                  current_azimuth, max_angle) ||
+        cuda_angle_is_between_raw(frame_angles[i].fov_start, frame_angles[i].fov_end,
+                                  last_azimuth, max_angle)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // CUDA kernel for decoding Hesai LiDAR points
@@ -112,9 +146,11 @@ __global__ void decode_hesai_packet_kernel(
     return;
   }
 
-  // Calculate azimuth index for lookup table (0.01 degree resolution)
-  // raw_azimuth is in 0.01 degree units
-  const uint32_t azimuth_idx = raw_azimuth % n_azimuths;
+  // Calculate azimuth index for lookup table
+  // Scale raw_azimuth by sensor's azimuth_scale to get LUT index
+  // For standard sensors (scale=1): no scaling needed
+  // For AT128 (scale=256): raw_azimuth/256 maps to LUT index
+  const uint32_t azimuth_idx = (raw_azimuth / config.azimuth_scale) % n_azimuths;
 
   // Lookup angle corrections with coalesced access
   // LUT is organized as [azimuth][channel] for optimal access pattern
@@ -153,8 +189,8 @@ __global__ void decode_hesai_packet_kernel(
 /// Processes an entire scan (typically ~3,240 packets) in a single kernel call
 /// Includes FOV filtering and overlap/scan assignment on GPU
 __global__ void decode_hesai_scan_batch_kernel(
-  const uint16_t * __restrict__ d_distances_ring,
-  const uint8_t * __restrict__ d_reflectivities_ring,
+  const uint16_t * __restrict__ d_distances_batch,
+  const uint8_t * __restrict__ d_reflectivities_batch,
   const uint32_t * __restrict__ d_raw_azimuths,
   const uint32_t * __restrict__ d_n_returns,
   const uint32_t * __restrict__ d_last_azimuths,  // Per-entry last_azimuth for overlap check
@@ -188,8 +224,8 @@ __global__ void decode_hesai_scan_batch_kernel(
                            + channel_id * config.max_returns + return_id;
 
   // Load distance and reflectivity
-  const uint16_t raw_distance = d_distances_ring[data_idx];
-  const uint8_t reflectivity = d_reflectivities_ring[data_idx];
+  const uint16_t raw_distance = d_distances_batch[data_idx];
+  const uint8_t reflectivity = d_reflectivities_batch[data_idx];
 
   // Early exit for invalid points
   if (raw_distance == 0) return;
@@ -205,14 +241,19 @@ __global__ void decode_hesai_scan_batch_kernel(
   const uint32_t raw_azimuth = d_raw_azimuths[packet_id];
 
   // Calculate azimuth index for lookup table
-  const uint32_t azimuth_idx = raw_azimuth % n_azimuths;
+  // For sensors with different degree_subdivisions, scale down to LUT index range
+  // azimuth_scale: raw_azimuth / azimuth_scale = LUT index
+  // For standard sensors (scale=1): no scaling needed
+  // For AT128 (scale=256): raw_azimuth/256 maps to LUT index
+  const uint32_t azimuth_idx = (raw_azimuth / config.azimuth_scale) % n_azimuths;
 
   // Lookup angle corrections
   const uint32_t lut_idx = azimuth_idx * config.n_channels + channel_id;
   const CudaAngleCorrectionData angle_data = angle_lut[lut_idx];
 
   // === FOV FILTERING (GPU) ===
-  // Check if azimuth is within configured field of view
+  // Check if corrected azimuth is within configured field of view
+  // This applies to both single-frame and multi-frame sensors to match CPU behavior
   const bool in_fov = cuda_angle_is_between(config.fov_min_rad, config.fov_max_rad,
                                             angle_data.azimuth_rad);
   if (!in_fov) return;
@@ -223,9 +264,18 @@ __global__ void decode_hesai_scan_batch_kernel(
   uint8_t in_current_scan = 1;  // Default: belongs to current scan
 
   // Check if we're in the overlap region
-  if (cuda_is_inside_overlap(last_azimuth, raw_azimuth,
-                             config.timestamp_reset_angle_raw, config.emit_angle_raw,
-                             config.n_azimuths_raw)) {
+  // Multi-frame sensors (AT128) have multiple overlap regions, one per frame
+  bool is_in_overlap = false;
+  if (config.is_multi_frame) {
+    is_in_overlap = cuda_is_inside_overlap_multiframe(
+      last_azimuth, raw_azimuth, config.frame_angles, config.n_frames, config.n_azimuths_raw);
+  } else {
+    is_in_overlap = cuda_is_inside_overlap(
+      last_azimuth, raw_azimuth, config.timestamp_reset_angle_raw, config.emit_angle_raw,
+      config.n_azimuths_raw);
+  }
+
+  if (is_in_overlap) {
     // In overlap region, check if azimuth is between emit_angle and emit_angle + 20 degrees
     // 20 degrees in radians = 20 * pi / 180 = 0.349066
     constexpr float overlap_margin_rad = 0.349066f;
@@ -257,8 +307,8 @@ __global__ void decode_hesai_scan_batch_kernel(
     if (n_returns == 2) {
       // return_id must be 0 here (we already checked return_id >= n_returns - 1)
       const uint32_t last_idx = group_base + 1;
-      const uint16_t last_raw_distance = d_distances_ring[last_idx];
-      const uint8_t last_reflectivity = d_reflectivities_ring[last_idx];
+      const uint16_t last_raw_distance = d_distances_batch[last_idx];
+      const uint8_t last_reflectivity = d_reflectivities_batch[last_idx];
 
       // IDENTICAL check (same distance AND reflectivity)
       if (raw_distance == last_raw_distance && reflectivity == last_reflectivity) {
@@ -275,8 +325,8 @@ __global__ void decode_hesai_scan_batch_kernel(
       for (uint32_t other_ret = 0; other_ret < n_returns; ++other_ret) {
         if (other_ret == return_id) continue;
 
-        const uint16_t other_raw_distance = d_distances_ring[group_base + other_ret];
-        const uint8_t other_reflectivity = d_reflectivities_ring[group_base + other_ret];
+        const uint16_t other_raw_distance = d_distances_batch[group_base + other_ret];
+        const uint8_t other_reflectivity = d_reflectivities_batch[group_base + other_ret];
 
         // IDENTICAL check
         if (raw_distance == other_raw_distance && reflectivity == other_reflectivity) {
@@ -411,12 +461,12 @@ bool HesaiCudaDecoder::decode_packet(
 }  // namespace nebula::drivers::cuda
 
 // C-linkage wrapper for launching kernel from hesai_decoder.hpp
-// This allows direct access to device pointers without going through the class interface
+// Config is passed by host reference — no device-to-host copy needed
 extern "C" void launch_decode_hesai_packet(
   const uint16_t * d_distances,
   const uint8_t * d_reflectivities,
   const nebula::drivers::cuda::CudaAngleCorrectionData * d_angle_lut,
-  const nebula::drivers::cuda::CudaDecoderConfig * d_config,
+  const nebula::drivers::cuda::CudaDecoderConfig & config,
   nebula::drivers::cuda::CudaNebulaPoint * d_points,
   uint32_t * d_count,
   uint32_t n_azimuths,
@@ -424,14 +474,6 @@ extern "C" void launch_decode_hesai_packet(
   cudaStream_t stream)
 {
   // NOTE: d_count is NOT reset here - caller is responsible for resetting it
-  // For batched mode, the caller resets once at the start, then accumulates across entries
-
-  // Copy config from device to host to get parameters
-  // This is necessary because we need config values for kernel launch
-  nebula::drivers::cuda::CudaDecoderConfig config;
-  cudaMemcpyAsync(&config, d_config, sizeof(nebula::drivers::cuda::CudaDecoderConfig),
-                  cudaMemcpyDeviceToHost, stream);
-  cudaStreamSynchronize(stream);  // Ensure config is available
 
   // Calculate optimal grid dimensions
   // Use 128 threads per block - good balance between occupancy and register usage
@@ -442,7 +484,7 @@ extern "C" void launch_decode_hesai_packet(
   dim3 grid(n_blocks_x, n_blocks_y);
   dim3 block(threads_per_block);
 
-  // Launch kernel with optimal configuration
+  // Launch kernel (config copied to device by value via kernel argument)
   nebula::drivers::cuda::decode_hesai_packet_kernel<<<grid, block, 0, stream>>>(
     d_distances,
     d_reflectivities,
@@ -461,40 +503,33 @@ extern "C" void launch_decode_hesai_packet(
 }
 
 // C-linkage wrapper for launching batched kernel (processes entire scan in one launch)
+// Config is passed by host reference — no device-to-host copy needed
 extern "C" void launch_decode_hesai_scan_batch(
-  const uint16_t * d_distances_ring,
-  const uint8_t * d_reflectivities_ring,
+  const uint16_t * d_distances_batch,
+  const uint8_t * d_reflectivities_batch,
   const uint32_t * d_raw_azimuths,
   const uint32_t * d_n_returns,
-  const uint32_t * d_last_azimuths,  // Per-entry last_azimuth for overlap check
+  const uint32_t * d_last_azimuths,
   const nebula::drivers::cuda::CudaAngleCorrectionData * d_angle_lut,
-  const nebula::drivers::cuda::CudaDecoderConfig * d_config,
+  const nebula::drivers::cuda::CudaDecoderConfig & config,
   nebula::drivers::cuda::CudaNebulaPoint * d_points,
   uint32_t * d_count,
   uint32_t n_azimuths,
   uint32_t n_packets,
   cudaStream_t stream)
 {
-  // Copy config to get parameters
-  nebula::drivers::cuda::CudaDecoderConfig config;
-  cudaMemcpyAsync(&config, d_config, sizeof(nebula::drivers::cuda::CudaDecoderConfig),
-                  cudaMemcpyDeviceToHost, stream);
-  cudaStreamSynchronize(stream);  // Ensure config is available
-
   // Calculate grid dimensions for batched processing
-  // Total work: n_packets * n_channels * max_returns
   const uint32_t total_work = n_packets * config.n_channels * config.max_returns;
-  const uint32_t threads_per_block = 256;  // Larger block size for better occupancy
+  const uint32_t threads_per_block = 256;
   const uint32_t n_blocks = (total_work + threads_per_block - 1) / threads_per_block;
 
   dim3 grid(n_blocks);
   dim3 block(threads_per_block);
 
-  // Launch batched kernel - processes entire scan in one call
-  // Now includes FOV filtering and overlap/scan assignment on GPU
+  // Launch batched kernel (config copied to device by value via kernel argument)
   nebula::drivers::cuda::decode_hesai_scan_batch_kernel<<<grid, block, 0, stream>>>(
-    d_distances_ring,
-    d_reflectivities_ring,
+    d_distances_batch,
+    d_reflectivities_batch,
     d_raw_azimuths,
     d_n_returns,
     d_last_azimuths,
@@ -510,10 +545,6 @@ extern "C" void launch_decode_hesai_scan_batch(
   if (err != cudaSuccess) {
     fprintf(stderr, "CUDA batched kernel launch failed: %s\n", cudaGetErrorString(err));
   }
-
-  // COMPACTION PASS: Pack valid points (distance > 0) contiguously
-  // This is done on CPU side after D2H copy in hesai_decoder.hpp
-  // The kernel outputs sparse data, CPU compacts while copying to point cloud
 }
 
 // =============================================================================
