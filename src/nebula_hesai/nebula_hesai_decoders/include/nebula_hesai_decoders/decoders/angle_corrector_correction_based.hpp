@@ -25,8 +25,11 @@
 #include <cassert>
 #include <cstdint>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <tuple>
+#include <vector>
 
 namespace nebula::drivers
 {
@@ -158,6 +161,37 @@ public:
 
     return corrected_azimuths;
   }
+
+#ifdef NEBULA_CUDA_ENABLED
+  /// @brief Get the number of mirror frames for this sensor
+  [[nodiscard]] size_t get_n_frames() const
+  {
+    return correction_ ? correction_->frameNumber : 1;
+  }
+
+  /// @brief Get frame angle boundaries for multi-frame CUDA support
+  /// @param frame_id Frame index
+  /// @param fov_start Output: raw azimuth where FOV starts for this frame
+  /// @param fov_end Output: raw azimuth where FOV ends for this frame
+  /// @param timestamp_reset Output: raw azimuth for timestamp reset
+  /// @param scan_emit Output: raw azimuth for scan emit
+  /// @return true if frame_id is valid
+  bool get_frame_angle_info(
+    uint32_t frame_id, uint32_t & fov_start, uint32_t & fov_end,
+    uint32_t & timestamp_reset, uint32_t & scan_emit) const
+  {
+    if (!correction_ || frame_id >= correction_->frameNumber) {
+      return false;
+    }
+
+    fov_start = correction_->startFrame[frame_id];
+    fov_end = correction_->endFrame[frame_id];
+    // For correction-based sensors, timestamp_reset and scan_emit correspond to frame boundaries
+    timestamp_reset = correction_->startFrame[frame_id];
+    scan_emit = correction_->endFrame[frame_id];
+    return true;
+  }
+#endif
 };
 
 }  // namespace nebula::drivers
