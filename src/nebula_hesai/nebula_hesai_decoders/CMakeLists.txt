@@ -21,12 +21,15 @@ if(BUILD_CUDA)
     list(APPEND CUDA_NVCC_FLAGS "--expt-relaxed-constexpr")
     list(APPEND CUDA_NVCC_FLAGS "-diag-suppress 20012")
 
-    # GPU architectures
-    list(APPEND CUDA_NVCC_FLAGS "-gencode arch=compute_75,code=sm_75")  # Turing
-    list(APPEND CUDA_NVCC_FLAGS "-gencode arch=compute_86,code=sm_86")  # Ampere
-    list(APPEND CUDA_NVCC_FLAGS "-gencode arch=compute_87,code=sm_87")  # Jetson Orin
-    list(APPEND CUDA_NVCC_FLAGS "-gencode arch=compute_89,code=sm_89")  # Ada
-    list(APPEND CUDA_NVCC_FLAGS "-gencode arch=compute_89,code=compute_89")  # PTX
+    # GPU architectures — set via -DCMAKE_CUDA_ARCHITECTURES on the command line,
+    # or fall back to a default set covering Turing through Ada + PTX for forward
+    # compatibility (e.g. Blackwell GPUs JIT from compute_89 PTX).
+    # Example: -DCMAKE_CUDA_ARCHITECTURES=89  (single-arch for fast builds)
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR CMAKE_CUDA_ARCHITECTURES STREQUAL "")
+      set(CMAKE_CUDA_ARCHITECTURES "75;86;87;89" CACHE STRING "CUDA architectures" FORCE)
+    endif()
+    # Also emit PTX for the highest arch so the driver can JIT for newer GPUs
+    list(APPEND CUDA_NVCC_FLAGS "-gencode arch=compute_89,code=compute_89")
 
     # Extended lambda support
     list(APPEND CUDA_NVCC_FLAGS "--extended-lambda")
@@ -64,7 +67,6 @@ target_link_libraries(
 if(BUILD_CUDA AND CUDA_KERNELS_EXIST)
   enable_language(CUDA)
 
-  set(CMAKE_CUDA_ARCHITECTURES "75;86;87;89")
   set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3 --expt-relaxed-constexpr")
 
   add_library(nebula_hesai_decoders_cuda SHARED
