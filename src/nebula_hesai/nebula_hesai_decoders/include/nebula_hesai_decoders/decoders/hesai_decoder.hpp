@@ -65,6 +65,7 @@ extern "C" void launch_decode_hesai_scan_batch(
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -540,9 +541,19 @@ private:
     gpu_scan_buffer_.packet_count = 0;
   }
 
-  /// @brief Initialize CUDA decoder and upload angle corrections
+  /// @brief Initialize CUDA decoder and upload angle corrections.
+  /// CUDA decode is opt-in: set NEBULA_USE_CUDA=1 environment variable to enable.
+  /// This is because GPU decode produces functionally equivalent but not bit-identical
+  /// output compared to CPU decode (different FOV/overlap boundary handling).
   void initialize_cuda()
   {
+    const char * cuda_env = std::getenv("NEBULA_USE_CUDA");
+    if (!cuda_env || std::string(cuda_env) != "1") {
+      NEBULA_LOG_STREAM(
+        logger_->info, "CUDA decode disabled (set NEBULA_USE_CUDA=1 to enable)");
+      return;
+    }
+
     cudaError_t err = cudaStreamCreate(&cuda_stream_);
     if (err != cudaSuccess) {
       NEBULA_LOG_STREAM(
