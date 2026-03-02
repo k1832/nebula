@@ -389,7 +389,7 @@ private:
   /// @param total_data_size Total number of distance/reflectivity elements
   /// @param config Config struct to upload to device
   void transfer_scan_to_device(
-    uint32_t n_entries, size_t total_data_size, const cuda::CudaDecoderConfig & config)
+    uint32_t n_entries, size_t total_data_size, const cuda::CudaDecoderConfig & /*config*/)
   {
     cudaMemcpyAsync(gpu_scan_buffer_.d_distances_batch, gpu_scan_buffer_.h_distances_staging,
                     total_data_size * sizeof(uint16_t),
@@ -413,7 +413,7 @@ private:
   /// @param valid_point_count Number of valid points reported by the kernel
   /// @param sparse_buffer_size Total sparse buffer size (n_entries * n_channels * max_returns)
   void process_gpu_results(
-    uint32_t n_entries, uint32_t valid_point_count, uint32_t sparse_buffer_size)
+    uint32_t n_entries, uint32_t /*valid_point_count*/, uint32_t sparse_buffer_size)
   {
     // Copy SPARSE buffer - points are at deterministic positions with gaps
     const uint32_t copy_size = std::min(sparse_buffer_size, static_cast<uint32_t>(cuda_point_buffer_.size()));
