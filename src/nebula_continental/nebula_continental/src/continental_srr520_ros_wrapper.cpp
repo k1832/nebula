@@ -213,5 +213,6 @@ rcl_interfaces::msg::SetParametersResult ContinentalSRR520RosWrapper::on_paramet
   return rcl_interfaces::build<SetParametersResult>().successful(true).reason("");
 }
 
-RCLCPP_COMPONENTS_REGISTER_NODE(ContinentalSRR520RosWrapper)
 }  // namespace nebula::ros
+
+RCLCPP_COMPONENTS_REGISTER_NODE(nebula::ros::ContinentalSRR520RosWrapper)
