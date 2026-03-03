@@ -259,9 +259,6 @@ private:
 #endif  // NEBULA_CUDA_PROFILING
 #endif  // NEBULA_CUDA_ENABLED
 
-  // CPU profiling: accumulated decode time across all packets in a scan
-  uint64_t accumulated_decode_ns_ = 0;
-
   /// @brief Validates and parse PandarPacket. Checks size and, if present, CRC checksums.
   /// @param packet The incoming PandarPacket
   /// @return Whether the packet was parsed successfully
@@ -1368,14 +1365,9 @@ public:
     }
 
     uint64_t decode_duration_ns = decode_watch.elapsed_ns();
-    accumulated_decode_ns_ += decode_duration_ns;
     uint64_t callbacks_duration_ns = 0;
 
     if (did_scan_complete) {
-      std::cerr << "PROFILING {\"d_cpu_unpack_ms\": " << (accumulated_decode_ns_ / 1e6)
-                << ", \"n_points\": " << output_frame_.pointcloud->size() << "}" << std::endl;
-      accumulated_decode_ns_ = 0;
-
       util::Stopwatch callback_watch;
       on_scan_complete();
       callbacks_duration_ns = callback_watch.elapsed_ns();
