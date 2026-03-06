@@ -35,6 +35,12 @@
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 
+#if defined(CUDA_BLACKBOARD_AVAILABLE) && defined(NEBULA_CUDA_ENABLED)
+#include <cuda_blackboard/cuda_blackboard_publisher.hpp>
+#include <cuda_blackboard/cuda_pointcloud2.hpp>
+#include <nebula_hesai_decoders/cuda/hesai_cuda_decoder.hpp>
+#endif
+
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -171,5 +177,20 @@ private:
     uint64_t receive_time_current_scan_ns{0};
     uint64_t publish_time_current_scan_ns{0};
   } current_scan_perf_counters_;
+
+#if defined(CUDA_BLACKBOARD_AVAILABLE) && defined(NEBULA_CUDA_ENABLED)
+  std::unique_ptr<cuda_blackboard::CudaBlackboardPublisher<cuda_blackboard::CudaPointCloud2>>
+    cuda_points_pub_;
+  cudaStream_t cuda_conversion_stream_ = nullptr;
+  uint8_t * d_pointcloud2_buffer_ = nullptr;
+  size_t pointcloud2_buffer_size_ = 0;
+  uint32_t * d_output_count_ = nullptr;
+
+  void initialize_cuda_pipeline();
+  void cleanup_cuda_pipeline();
+  void publish_cuda_pointcloud(
+    const drivers::cuda::GpuPointCloud & gpu_cloud, double timestamp_s);
+  static std::vector<sensor_msgs::msg::PointField> create_xyzircaedt_fields();
+#endif
 };
 }  // namespace nebula::ros
