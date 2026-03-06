@@ -538,6 +538,13 @@ private:
                            << "ms kernel=" << kernel_ms << "ms d2h=" << d2h_ms
                            << "ms total=" << (h2d_ms + kernel_ms + d2h_ms) << "ms");
       }
+
+      std::cerr << "PROFILING {\"d_gpu_h2d_ms\": " << h2d_ms
+                << ", \"d_gpu_kernel_ms\": " << kernel_ms
+                << ", \"d_gpu_d2h_ms\": " << d2h_ms
+                << ", \"d_gpu_total_ms\": " << (h2d_ms + kernel_ms + d2h_ms)
+                << ", \"n_points\": " << valid_point_count
+                << "}" << std::endl;
     }
 #endif
 
@@ -1178,9 +1185,15 @@ public:
     accumulated_decode_ns_ += decode_duration_ns;
 
     if (did_scan_complete_) {
-      std::cerr << "PROFILING {\"d_cpu_unpack_ms\": " << (accumulated_decode_ns_ / 1e6)
-                << ", \"n_points\": " << last_completed_scan_points_
-                << "}" << std::endl;
+#ifdef NEBULA_CUDA_ENABLED
+      if (!cuda_enabled_) {
+#endif
+        std::cerr << "PROFILING {\"d_cpu_unpack_ms\": " << (accumulated_decode_ns_ / 1e6)
+                  << ", \"n_points\": " << last_completed_scan_points_
+                  << "}" << std::endl;
+#ifdef NEBULA_CUDA_ENABLED
+      }
+#endif
       accumulated_decode_ns_ = 0;
     }
 
