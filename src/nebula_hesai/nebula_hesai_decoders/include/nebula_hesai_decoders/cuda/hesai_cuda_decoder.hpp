@@ -92,6 +92,19 @@ struct CudaDecoderConfig
   bool is_multi_frame;  // True if sensor has multiple frames (uses frame_angles)
 };
 
+/// @brief GPU point cloud structure for zero-copy pipeline
+/// Allows downstream CUDA modules to access points directly on GPU without D2H copy
+struct GpuPointCloud
+{
+  const CudaNebulaPoint * d_points = nullptr;
+  uint32_t point_count = 0;
+  uint64_t timestamp_ns = 0;
+  bool valid = false;
+};
+
+/// @brief PointCloud2 format constants for PointXYZIRCAEDT
+constexpr uint32_t POINTCLOUD2_POINT_STEP = 32;
+
 /// @brief Main CUDA decoder class for Hesai LiDAR
 class HesaiCudaDecoder
 {
@@ -151,6 +164,25 @@ void launch_decode_hesai_scan_batch(
     uint32_t* d_count,
     uint32_t n_azimuths,
     uint32_t n_packets,
+    cudaStream_t stream);
+
+/// @brief Launch kernel to convert CudaNebulaPoint to PointCloud2 format (PointXYZIRCAEDT)
+/// Uses atomic compaction to filter out invalid points
+void launch_convert_to_pointcloud2(
+    const nebula::drivers::cuda::CudaNebulaPoint* d_input,
+    uint8_t* d_output,
+    uint32_t* d_output_count,
+    uint32_t input_count,
+    bool filter_current_scan,
+    cudaStream_t stream);
+
+/// @brief Launch ordered conversion kernel (preserves point order, no compaction)
+void launch_convert_to_pointcloud2_ordered(
+    const nebula::drivers::cuda::CudaNebulaPoint* d_input,
+    uint8_t* d_output,
+    uint8_t* d_valid_mask,
+    uint32_t input_count,
+    bool filter_current_scan,
     cudaStream_t stream);
 
 }  // extern "C"
