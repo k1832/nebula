@@ -95,13 +95,6 @@ if(BUILD_CUDA AND CUDA_KERNELS_EXIST)
   target_compile_definitions(nebula_hesai_decoders_cuda PUBLIC NEBULA_CUDA_ENABLED)
   target_compile_definitions(nebula_hesai_decoders PUBLIC NEBULA_CUDA_ENABLED)
 
-  # Optional: CUDA profiling instrumentation (off by default, enable for benchmarking)
-  option(NEBULA_CUDA_PROFILING "Enable CUDA profiling instrumentation" OFF)
-  if(NEBULA_CUDA_PROFILING)
-    target_compile_definitions(nebula_hesai_decoders PUBLIC NEBULA_CUDA_PROFILING)
-    message(STATUS "CUDA profiling instrumentation enabled")
-  endif()
-
   # Add CUDA include directories to main library for header resolution
   target_include_directories(nebula_hesai_decoders
     PUBLIC ${CUDA_INCLUDE_DIRS})

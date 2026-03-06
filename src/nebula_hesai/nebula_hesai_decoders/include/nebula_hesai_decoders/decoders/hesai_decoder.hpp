@@ -110,10 +110,6 @@ private:
   uint64_t callback_time_ns_{0};
   /// @brief Whether a scan was completed during the current unpack() call (reset per packet)
   bool did_scan_complete_{false};
-  /// @brief Accumulated decode time across all packets in a scan (for CPU profiling)
-  uint64_t accumulated_decode_ns_{0};
-  /// @brief Point count of the last completed scan (for CPU profiling)
-  size_t last_completed_scan_points_{0};
   /// @brief The current block being processed (used for timestamp reset calculation)
   size_t current_block_id_{0};
 
@@ -248,24 +244,6 @@ private:
   uint32_t gpu_output_point_count_ = 0;
   /// @brief Scan timestamp from last GPU decode (for get_gpu_pointcloud())
   uint64_t gpu_output_timestamp_ns_ = 0;
-
-#ifdef NEBULA_CUDA_PROFILING
-  // CUDA event timing for performance instrumentation
-  cudaEvent_t timing_event_start_ = nullptr;
-  cudaEvent_t timing_event_after_h2d_ = nullptr;
-  cudaEvent_t timing_event_after_kernel_ = nullptr;
-  cudaEvent_t timing_event_after_d2h_ = nullptr;
-  bool timing_events_initialized_ = false;
-
-  struct GpuTimingStats
-  {
-    double total_h2d_ms = 0.0;
-    double total_kernel_ms = 0.0;
-    double total_d2h_ms = 0.0;
-    uint32_t flush_count = 0;
-  };
-  GpuTimingStats gpu_timing_stats_;
-#endif  // NEBULA_CUDA_PROFILING
 #endif  // NEBULA_CUDA_ENABLED
 
   /// @brief Validates and parse PandarPacket. Checks size and, if present, CRC checksums.
@@ -485,19 +463,7 @@ private:
 
     cuda::CudaDecoderConfig config = build_batch_config(n_entries);
 
-#ifdef NEBULA_CUDA_PROFILING
-    if (timing_events_initialized_) {
-      cudaEventRecord(timing_event_start_, cuda_stream_);
-    }
-#endif
-
     transfer_scan_to_device(n_entries, total_data_size);
-
-#ifdef NEBULA_CUDA_PROFILING
-    if (timing_events_initialized_) {
-      cudaEventRecord(timing_event_after_h2d_, cuda_stream_);
-    }
-#endif
 
     // Reset output counter and zero output buffer for deterministic sparse indexing
     cudaMemsetAsync(d_count_, 0, sizeof(uint32_t), cuda_stream_);
@@ -511,49 +477,10 @@ private:
       gpu_scan_buffer_.d_last_azimuths, cuda_decoder_->get_angle_lut(), config, d_points_,
       d_count_, cuda_n_azimuths_, n_entries, cuda_stream_);
 
-#ifdef NEBULA_CUDA_PROFILING
-    if (timing_events_initialized_) {
-      cudaEventRecord(timing_event_after_kernel_, cuda_stream_);
-    }
-#endif
-
     cudaStreamSynchronize(cuda_stream_);
 
     uint32_t valid_point_count = 0;
     cudaMemcpy(&valid_point_count, d_count_, sizeof(uint32_t), cudaMemcpyDeviceToHost);
-
-#ifdef NEBULA_CUDA_PROFILING
-    if (timing_events_initialized_) {
-      cudaEventRecord(timing_event_after_d2h_, cuda_stream_);
-      cudaEventSynchronize(timing_event_after_d2h_);
-
-      float h2d_ms = 0.0f, kernel_ms = 0.0f, d2h_ms = 0.0f;
-      cudaEventElapsedTime(&h2d_ms, timing_event_start_, timing_event_after_h2d_);
-      cudaEventElapsedTime(&kernel_ms, timing_event_after_h2d_, timing_event_after_kernel_);
-      cudaEventElapsedTime(&d2h_ms, timing_event_after_kernel_, timing_event_after_d2h_);
-
-      gpu_timing_stats_.total_h2d_ms += h2d_ms;
-      gpu_timing_stats_.total_kernel_ms += kernel_ms;
-      gpu_timing_stats_.total_d2h_ms += d2h_ms;
-      gpu_timing_stats_.flush_count++;
-
-      if (gpu_timing_stats_.flush_count <= 10 || gpu_timing_stats_.flush_count % 100 == 0) {
-        NEBULA_LOG_STREAM(
-          logger_->info, "[GPU_TIMING] flush#"
-                           << gpu_timing_stats_.flush_count << " entries=" << n_entries
-                           << " points=" << valid_point_count << " h2d=" << h2d_ms
-                           << "ms kernel=" << kernel_ms << "ms d2h=" << d2h_ms
-                           << "ms total=" << (h2d_ms + kernel_ms + d2h_ms) << "ms");
-      }
-
-      std::cerr << "PROFILING {\"d_gpu_h2d_ms\": " << h2d_ms
-                << ", \"d_gpu_kernel_ms\": " << kernel_ms
-                << ", \"d_gpu_d2h_ms\": " << d2h_ms
-                << ", \"d_gpu_total_ms\": " << (h2d_ms + kernel_ms + d2h_ms)
-                << ", \"n_points\": " << valid_point_count
-                << "}" << std::endl;
-    }
-#endif
 
     if (valid_point_count == 0) {
       gpu_scan_buffer_.packet_count = 0;
@@ -819,36 +746,6 @@ private:
                        << n_channels << " channels and " << cuda_n_azimuths_
                        << " azimuth divisions"
                        << (is_multi_frame_sensor_ ? " (multi-frame)" : ""));
-
-#ifdef NEBULA_CUDA_PROFILING
-    // Initialize CUDA events for timing instrumentation
-    cudaError_t event_err = cudaEventCreate(&timing_event_start_);
-    if (event_err == cudaSuccess) {
-      event_err = cudaEventCreate(&timing_event_after_h2d_);
-    }
-    if (event_err == cudaSuccess) {
-      event_err = cudaEventCreate(&timing_event_after_kernel_);
-    }
-    if (event_err == cudaSuccess) {
-      event_err = cudaEventCreate(&timing_event_after_d2h_);
-    }
-    if (event_err == cudaSuccess) {
-      timing_events_initialized_ = true;
-      NEBULA_LOG_STREAM(logger_->info, "CUDA timing events initialized");
-    } else {
-      NEBULA_LOG_STREAM(
-        logger_->warn,
-        "Failed to initialize CUDA timing events: " << cudaGetErrorString(event_err));
-      if (timing_event_start_) cudaEventDestroy(timing_event_start_);
-      if (timing_event_after_h2d_) cudaEventDestroy(timing_event_after_h2d_);
-      if (timing_event_after_kernel_) cudaEventDestroy(timing_event_after_kernel_);
-      if (timing_event_after_d2h_) cudaEventDestroy(timing_event_after_d2h_);
-      timing_event_start_ = nullptr;
-      timing_event_after_h2d_ = nullptr;
-      timing_event_after_kernel_ = nullptr;
-      timing_event_after_d2h_ = nullptr;
-    }
-#endif  // NEBULA_CUDA_PROFILING
   }
 #endif  // NEBULA_CUDA_ENABLED
 
@@ -1023,7 +920,6 @@ private:
 #endif
 
     auto & completed_frame = frame_buffers_[buffer_index];
-    last_completed_scan_points_ = completed_frame.pointcloud->size();
     constexpr uint64_t nanoseconds_per_second = 1'000'000'000ULL;
     double scan_timestamp_s =
       static_cast<double>(completed_frame.scan_timestamp_ns / nanoseconds_per_second) +
@@ -1118,32 +1014,6 @@ public:
     if (cuda_stream_) {
       cudaStreamDestroy(cuda_stream_);
     }
-
-#ifdef NEBULA_CUDA_PROFILING
-    if (timing_event_start_) {
-      cudaEventDestroy(timing_event_start_);
-    }
-    if (timing_event_after_h2d_) {
-      cudaEventDestroy(timing_event_after_h2d_);
-    }
-    if (timing_event_after_kernel_) {
-      cudaEventDestroy(timing_event_after_kernel_);
-    }
-    if (timing_event_after_d2h_) {
-      cudaEventDestroy(timing_event_after_d2h_);
-    }
-    if (gpu_timing_stats_.flush_count > 0) {
-      double avg_h2d = gpu_timing_stats_.total_h2d_ms / gpu_timing_stats_.flush_count;
-      double avg_kernel = gpu_timing_stats_.total_kernel_ms / gpu_timing_stats_.flush_count;
-      double avg_d2h = gpu_timing_stats_.total_d2h_ms / gpu_timing_stats_.flush_count;
-      double avg_total = avg_h2d + avg_kernel + avg_d2h;
-      NEBULA_LOG_STREAM(
-        logger_->info, "[GPU_TIMING_SUMMARY] flushes="
-                         << gpu_timing_stats_.flush_count << " avg_h2d=" << avg_h2d
-                         << "ms avg_kernel=" << avg_kernel << "ms avg_d2h=" << avg_d2h
-                         << "ms avg_total=" << avg_total << "ms");
-    }
-#endif  // NEBULA_CUDA_PROFILING
   }
 #endif  // NEBULA_CUDA_ENABLED
 
@@ -1214,20 +1084,6 @@ public:
     }
 
     uint64_t decode_duration_ns = decode_watch.elapsed_ns();
-    accumulated_decode_ns_ += decode_duration_ns;
-
-    if (did_scan_complete_) {
-#ifdef NEBULA_CUDA_ENABLED
-      if (!cuda_enabled_) {
-#endif
-        std::cerr << "PROFILING {\"d_cpu_unpack_ms\": " << (accumulated_decode_ns_ / 1e6)
-                  << ", \"n_points\": " << last_completed_scan_points_
-                  << "}" << std::endl;
-#ifdef NEBULA_CUDA_ENABLED
-      }
-#endif
-      accumulated_decode_ns_ = 0;
-    }
 
     PacketMetadata metadata;
     metadata.packet_timestamp_ns = hesai_packet::get_timestamp_ns(packet_);
