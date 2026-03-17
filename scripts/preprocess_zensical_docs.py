@@ -237,6 +237,7 @@ _DRAWIO_CONFIG = {
     "edit": "_blank",
     "lightbox": "1",
     "darkmode": True,
+    "style": "",
 }
 
 
