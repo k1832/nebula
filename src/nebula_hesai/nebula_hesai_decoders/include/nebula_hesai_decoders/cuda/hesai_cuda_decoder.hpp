@@ -96,7 +96,7 @@ class HesaiCudaDecoder
 {
 public:
   HesaiCudaDecoder();
-  ~HesaiCudaDecoder();
+  virtual ~HesaiCudaDecoder();
 
   /// @brief Initialize decoder with maximum points and channels
   bool initialize(size_t max_points, uint32_t n_channels);
