@@ -1,4 +1,4 @@
-// Copyright 2024 TIER IV, Inc.
+// Copyright 2026 TIER IV, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -32,8 +32,8 @@ struct CudaNebulaPoint
   float elevation;
   float intensity;
   uint8_t return_type;
-  uint16_t channel;
   uint8_t in_current_scan;  // 1 = belongs to current scan, 0 = belongs to output/next scan
+  uint16_t channel;
   uint32_t entry_id;        // Block group ID for batched processing (used for sorting & filtering)
 };
 
@@ -89,7 +89,6 @@ struct CudaDecoderConfig
   // Multi-frame support for sensors like AT128 (has 4 mirror frames)
   uint32_t n_frames;  // Number of frames (1 for single-frame, 4 for AT128)
   CudaFrameAngleInfo frame_angles[MAX_CUDA_FRAMES];  // Per-frame angle boundaries
-  bool is_multi_frame;  // True if sensor has multiple frames (uses frame_angles)
 };
 
 /// @brief Main CUDA decoder class for Hesai LiDAR

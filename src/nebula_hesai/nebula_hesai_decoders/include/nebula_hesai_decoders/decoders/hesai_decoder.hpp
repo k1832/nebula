@@ -239,9 +239,6 @@ private:
   uint32_t cuda_emit_angle_raw_ = 0;
   uint32_t cuda_timestamp_reset_angle_raw_ = 0;
 
-  /// @brief Whether this is a multi-frame sensor (e.g., AT128 with 4 mirror frames)
-  bool is_multi_frame_sensor_ = false;
-
 #ifdef NEBULA_CUDA_PROFILING
   // CUDA event timing for performance instrumentation
   cudaEvent_t timing_event_start_ = nullptr;
@@ -349,7 +346,6 @@ private:
     config.max_output_points = n_entries * n_channels * max_returns;
 
     if constexpr (SensorT::uses_calibration_based_angles) {
-      config.is_multi_frame = false;
       config.n_frames = 1;
       config.timestamp_reset_angle_raw = cuda_timestamp_reset_angle_raw_;
       config.emit_angle_raw = cuda_emit_angle_raw_;
@@ -358,7 +354,6 @@ private:
       config.frame_angles[0].timestamp_reset = cuda_timestamp_reset_angle_raw_;
       config.frame_angles[0].scan_emit = cuda_emit_angle_raw_;
     } else {
-      config.is_multi_frame = true;
       config.n_frames = static_cast<uint32_t>(angle_corrector_.get_n_frames());
       config.timestamp_reset_angle_raw = 0;
       config.emit_angle_raw = 0;
@@ -777,8 +772,8 @@ private:
     cuda_decoder_->upload_angle_corrections(angle_lut, cuda_n_azimuths_, n_channels);
 
     // Compute cached raw angle values for GPU config
+    bool multi_frame = false;
     if constexpr (SensorT::uses_calibration_based_angles) {
-      is_multi_frame_sensor_ = false;
       auto [emit_raw, reset_raw, fov_start_raw, fov_end_raw] =
         angle_corrector_.get_cuda_raw_angles(
           sensor_configuration_->cloud_min_angle, sensor_configuration_->cloud_max_angle,
@@ -786,7 +781,7 @@ private:
       cuda_emit_angle_raw_ = emit_raw;
       cuda_timestamp_reset_angle_raw_ = reset_raw;
     } else {
-      is_multi_frame_sensor_ = true;
+      multi_frame = true;
       size_t n_frames = angle_corrector_.get_n_frames();
       NEBULA_LOG_STREAM(
         logger_->info,
@@ -798,7 +793,7 @@ private:
       logger_->info, "CUDA decoder initialized successfully with "
                        << n_channels << " channels and " << cuda_n_azimuths_
                        << " azimuth divisions"
-                       << (is_multi_frame_sensor_ ? " (multi-frame)" : ""));
+                       << (multi_frame ? " (multi-frame)" : ""));
 
 #ifdef NEBULA_CUDA_PROFILING
     // Initialize CUDA events for timing instrumentation

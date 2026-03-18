@@ -1,4 +1,4 @@
-// Copyright 2024 TIER IV, Inc.
+// Copyright 2026 TIER IV, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -113,12 +113,18 @@ __global__ void decode_hesai_packet_kernel(
   const uint32_t lut_idx = azimuth_idx * config.n_channels + channel_id;
   const CudaAngleCorrectionData angle_data = angle_lut[lut_idx];
 
+  // FOV filtering
+  const bool in_fov = cuda_angle_is_between(config.fov_min_rad, config.fov_max_rad,
+                                            angle_data.azimuth_rad);
+  if (!in_fov) return;
+
   const float xy_distance = distance * angle_data.cos_elevation;
   const float x = xy_distance * angle_data.sin_azimuth;
   const float y = xy_distance * angle_data.cos_azimuth;
   const float z = distance * angle_data.sin_elevation;
 
   const uint32_t output_idx = atomicAdd(output_count, 1);
+  if (output_idx >= config.max_output_points) return;
 
   CudaNebulaPoint & out_pt = output_points[output_idx];
   out_pt.x = x;
@@ -186,7 +192,7 @@ __global__ void decode_hesai_scan_batch_kernel(
   uint8_t in_current_scan = 1;
 
   bool is_in_overlap = false;
-  if (config.is_multi_frame) {
+  if (config.n_frames > 1) {
     is_in_overlap = cuda_is_inside_overlap_multiframe(
       last_azimuth, raw_azimuth, config.frame_angles, config.n_frames, config.n_azimuths_raw);
   } else {
@@ -253,8 +259,6 @@ compute_coordinates:
   const float x = xy_distance * angle_data.sin_azimuth;
   const float y = xy_distance * angle_data.cos_azimuth;
   const float z = distance * angle_data.sin_elevation;
-
-  if (global_tid >= config.max_output_points) return;
 
   CudaNebulaPoint & out_pt = output_points[global_tid];
   out_pt.x = x;
