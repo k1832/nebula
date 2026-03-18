@@ -17,7 +17,6 @@ if(BUILD_CUDA)
     message(STATUS "CUDA found: ${CUDAToolkit_VERSION}")
 
     # CUDA compiler flags
-    list(APPEND CUDA_NVCC_FLAGS "--expt-relaxed-constexpr")
     list(APPEND CUDA_NVCC_FLAGS "-diag-suppress 20012")
 
     # GPU architectures — set via -DCMAKE_CUDA_ARCHITECTURES on the command line,
@@ -66,7 +65,7 @@ target_link_libraries(
 if(BUILD_CUDA AND CUDA_KERNELS_EXIST)
   enable_language(CUDA)
 
-  set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3 --expt-relaxed-constexpr")
+  set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3")
 
   add_library(nebula_hesai_decoders_cuda SHARED
     src/cuda/hesai_cuda_kernels.cu
