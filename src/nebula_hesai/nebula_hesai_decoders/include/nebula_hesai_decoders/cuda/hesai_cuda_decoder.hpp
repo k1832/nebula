@@ -126,7 +126,8 @@ private:
 extern "C" {
 
 /// @brief Launch kernel to decode a single Hesai packet
-void launch_decode_hesai_packet(
+/// @return true on success, false on CUDA error
+bool launch_decode_hesai_packet(
     const uint16_t* d_distances,
     const uint8_t* d_reflectivities,
     const nebula::drivers::cuda::CudaAngleCorrectionData* d_angle_lut,
@@ -138,7 +139,8 @@ void launch_decode_hesai_packet(
     cudaStream_t stream);
 
 /// @brief Launch batched kernel to decode entire scan
-void launch_decode_hesai_scan_batch(
+/// @return true on success, false on CUDA error
+bool launch_decode_hesai_scan_batch(
     const uint16_t* d_distances_batch,
     const uint8_t* d_reflectivities_batch,
     const uint32_t* d_raw_azimuths,

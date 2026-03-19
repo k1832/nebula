@@ -27,7 +27,7 @@
 #include "nebula_hesai_decoders/cuda/hesai_cuda_decoder.hpp"
 
 // C-linkage kernel launcher declarations
-extern "C" void launch_decode_hesai_packet(
+extern "C" bool launch_decode_hesai_packet(
   const uint16_t * d_distances,
   const uint8_t * d_reflectivities,
   const nebula::drivers::cuda::CudaAngleCorrectionData * d_angle_lut,
@@ -38,7 +38,7 @@ extern "C" void launch_decode_hesai_packet(
   uint32_t raw_azimuth,
   cudaStream_t stream);
 
-extern "C" void launch_decode_hesai_scan_batch(
+extern "C" bool launch_decode_hesai_scan_batch(
   const uint16_t * d_distances_batch,
   const uint8_t * d_reflectivities_batch,
   const uint32_t * d_raw_azimuths,
@@ -493,11 +493,14 @@ private:
       d_points_, 0, sparse_buffer_size * sizeof(cuda::CudaNebulaPoint), cuda_stream_);
 
     // Launch batched kernel
-    launch_decode_hesai_scan_batch(
-      gpu_scan_buffer_.d_distances_batch, gpu_scan_buffer_.d_reflectivities_batch,
-      gpu_scan_buffer_.d_raw_azimuths, gpu_scan_buffer_.d_n_returns,
-      gpu_scan_buffer_.d_last_azimuths, cuda_decoder_->get_angle_lut(), config, d_points_,
-      d_count_, cuda_n_azimuths_, n_entries, cuda_stream_);
+    if (!launch_decode_hesai_scan_batch(
+          gpu_scan_buffer_.d_distances_batch, gpu_scan_buffer_.d_reflectivities_batch,
+          gpu_scan_buffer_.d_raw_azimuths, gpu_scan_buffer_.d_n_returns,
+          gpu_scan_buffer_.d_last_azimuths, cuda_decoder_->get_angle_lut(), config, d_points_,
+          d_count_, cuda_n_azimuths_, n_entries, cuda_stream_)) {
+      NEBULA_LOG_STREAM(logger_->error, "CUDA batched kernel launch failed");
+      return;
+    }
 
 #ifdef NEBULA_CUDA_PROFILING
     if (timing_events_initialized_) {

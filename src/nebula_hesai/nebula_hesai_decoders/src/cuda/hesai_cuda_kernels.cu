@@ -15,8 +15,6 @@
 #include "nebula_hesai_decoders/cuda/hesai_cuda_decoder.hpp"
 
 #include <cuda_runtime.h>
-#include <cstdio>
-#include <cstring>
 
 namespace nebula::drivers::cuda
 {
@@ -307,8 +305,6 @@ bool HesaiCudaDecoder::upload_angle_corrections(
   uint32_t n_channels)
 {
   if (angle_lut.size() != n_azimuths * n_channels) {
-    fprintf(stderr, "CUDA: Angle LUT size mismatch: %zu vs expected %u\n",
-            angle_lut.size(), n_azimuths * n_channels);
     return false;
   }
 
@@ -323,13 +319,11 @@ bool HesaiCudaDecoder::upload_angle_corrections(
   const size_t lut_size = angle_lut.size() * sizeof(CudaAngleCorrectionData);
   cudaError_t err = cudaMalloc(&d_angle_lut_, lut_size);
   if (err != cudaSuccess) {
-    fprintf(stderr, "CUDA: Failed to allocate angle LUT: %s\n", cudaGetErrorString(err));
     return false;
   }
 
   err = cudaMemcpy(d_angle_lut_, angle_lut.data(), lut_size, cudaMemcpyHostToDevice);
   if (err != cudaSuccess) {
-    fprintf(stderr, "CUDA: Failed to upload angle LUT: %s\n", cudaGetErrorString(err));
     cudaFree(d_angle_lut_);
     d_angle_lut_ = nullptr;
     return false;
@@ -341,7 +335,7 @@ bool HesaiCudaDecoder::upload_angle_corrections(
 }  // namespace nebula::drivers::cuda
 
 // C-linkage wrapper for per-packet kernel
-extern "C" void launch_decode_hesai_packet(
+extern "C" bool launch_decode_hesai_packet(
   const uint16_t * d_distances,
   const uint8_t * d_reflectivities,
   const nebula::drivers::cuda::CudaAngleCorrectionData * d_angle_lut,
@@ -363,14 +357,11 @@ extern "C" void launch_decode_hesai_packet(
     d_distances, d_reflectivities, d_angle_lut, config,
     d_points, d_count, n_azimuths, raw_azimuth);
 
-  cudaError_t err = cudaGetLastError();
-  if (err != cudaSuccess) {
-    fprintf(stderr, "CUDA kernel launch failed: %s\n", cudaGetErrorString(err));
-  }
+  return cudaGetLastError() == cudaSuccess;
 }
 
 // C-linkage wrapper for batched kernel
-extern "C" void launch_decode_hesai_scan_batch(
+extern "C" bool launch_decode_hesai_scan_batch(
   const uint16_t * d_distances_batch,
   const uint8_t * d_reflectivities_batch,
   const uint32_t * d_raw_azimuths,
@@ -395,8 +386,5 @@ extern "C" void launch_decode_hesai_scan_batch(
     d_distances_batch, d_reflectivities_batch, d_raw_azimuths, d_n_returns, d_last_azimuths,
     d_angle_lut, config, d_points, d_count, n_azimuths, n_packets);
 
-  cudaError_t err = cudaGetLastError();
-  if (err != cudaSuccess) {
-    fprintf(stderr, "CUDA batched kernel launch failed: %s\n", cudaGetErrorString(err));
-  }
+  return cudaGetLastError() == cudaSuccess;
 }
