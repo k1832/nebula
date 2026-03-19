@@ -26,18 +26,7 @@
 #ifdef NEBULA_CUDA_ENABLED
 #include "nebula_hesai_decoders/cuda/hesai_cuda_decoder.hpp"
 
-// C-linkage kernel launcher declarations
-extern "C" bool launch_decode_hesai_packet(
-  const uint16_t * d_distances,
-  const uint8_t * d_reflectivities,
-  const nebula::drivers::cuda::CudaAngleCorrectionData * d_angle_lut,
-  const nebula::drivers::cuda::CudaDecoderConfig & config,
-  nebula::drivers::cuda::CudaNebulaPoint * d_points,
-  uint32_t * d_count,
-  uint32_t n_azimuths,
-  uint32_t raw_azimuth,
-  cudaStream_t stream);
-
+// C-linkage kernel launcher declaration
 extern "C" bool launch_decode_hesai_scan_batch(
   const uint16_t * d_distances_batch,
   const uint8_t * d_reflectivities_batch,

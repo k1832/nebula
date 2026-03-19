@@ -69,74 +69,6 @@ __device__ __forceinline__ bool cuda_is_inside_overlap_multiframe(
   return false;
 }
 
-// CUDA kernel for decoding a single Hesai LiDAR packet
-__global__ void decode_hesai_packet_kernel(
-  const uint16_t * __restrict__ distances,
-  const uint8_t * __restrict__ reflectivities,
-  const CudaAngleCorrectionData * __restrict__ angle_lut,
-  const CudaDecoderConfig config,
-  CudaNebulaPoint * __restrict__ output_points,
-  uint32_t * __restrict__ output_count,
-  uint32_t n_azimuths,
-  uint32_t raw_azimuth)
-{
-  const uint32_t channel_id = blockIdx.x * blockDim.x + threadIdx.x;
-  const uint32_t block_id = blockIdx.y;
-
-  if (channel_id >= config.n_channels || block_id >= config.n_blocks) {
-    return;
-  }
-
-  const uint32_t data_stride = config.data_stride > 0 ? config.data_stride : config.n_blocks;
-  const uint32_t data_idx = channel_id * data_stride + block_id;
-
-  const uint16_t raw_distance = distances[data_idx];
-  const uint8_t reflectivity = reflectivities[data_idx];
-
-  if (raw_distance == 0) {
-    return;
-  }
-
-  const float distance = static_cast<float>(raw_distance) * config.dis_unit;
-
-  if (distance < config.min_range || distance > config.max_range) {
-    return;
-  }
-
-  if (distance < config.sensor_min_range || distance > config.sensor_max_range) {
-    return;
-  }
-
-  const uint32_t azimuth_idx = (raw_azimuth / config.azimuth_scale) % n_azimuths;
-  const uint32_t lut_idx = azimuth_idx * config.n_channels + channel_id;
-  const CudaAngleCorrectionData angle_data = angle_lut[lut_idx];
-
-  // FOV filtering
-  const bool in_fov = cuda_angle_is_between(config.fov_min_rad, config.fov_max_rad,
-                                            angle_data.azimuth_rad);
-  if (!in_fov) return;
-
-  const float xy_distance = distance * angle_data.cos_elevation;
-  const float x = xy_distance * angle_data.sin_azimuth;
-  const float y = xy_distance * angle_data.cos_azimuth;
-  const float z = distance * angle_data.sin_elevation;
-
-  const uint32_t output_idx = atomicAdd(output_count, 1);
-  if (output_idx >= config.max_output_points) return;
-
-  CudaNebulaPoint & out_pt = output_points[output_idx];
-  out_pt.x = x;
-  out_pt.y = y;
-  out_pt.z = z;
-  out_pt.distance = distance;
-  out_pt.azimuth = angle_data.azimuth_rad;
-  out_pt.elevation = angle_data.elevation_rad;
-  out_pt.intensity = static_cast<float>(reflectivity);
-  out_pt.return_type = static_cast<uint8_t>(block_id);
-  out_pt.channel = static_cast<uint16_t>(channel_id);
-  out_pt.entry_id = config.entry_id;
-}
-
 /// @brief Batched kernel for processing an entire scan in one launch
 __global__ void decode_hesai_scan_batch_kernel(
   const uint16_t * __restrict__ d_distances_batch,
@@ -333,32 +265,6 @@ bool HesaiCudaDecoder::upload_angle_corrections(
 }
 
 }  // namespace nebula::drivers::cuda
-
-// C-linkage wrapper for per-packet kernel
-extern "C" bool launch_decode_hesai_packet(
-  const uint16_t * d_distances,
-  const uint8_t * d_reflectivities,
-  const nebula::drivers::cuda::CudaAngleCorrectionData * d_angle_lut,
-  const nebula::drivers::cuda::CudaDecoderConfig & config,
-  nebula::drivers::cuda::CudaNebulaPoint * d_points,
-  uint32_t * d_count,
-  uint32_t n_azimuths,
-  uint32_t raw_azimuth,
-  cudaStream_t stream)
-{
-  const uint32_t threads_per_block = 128;
-  const uint32_t n_blocks_x = (config.n_channels + threads_per_block - 1) / threads_per_block;
-  const uint32_t n_blocks_y = config.n_blocks;
-
-  dim3 grid(n_blocks_x, n_blocks_y);
-  dim3 block(threads_per_block);
-
-  nebula::drivers::cuda::decode_hesai_packet_kernel<<<grid, block, 0, stream>>>(
-    d_distances, d_reflectivities, d_angle_lut, config,
-    d_points, d_count, n_azimuths, raw_azimuth);
-
-  return cudaGetLastError() == cudaSuccess;
-}
 
 // C-linkage wrapper for batched kernel
 extern "C" bool launch_decode_hesai_scan_batch(
