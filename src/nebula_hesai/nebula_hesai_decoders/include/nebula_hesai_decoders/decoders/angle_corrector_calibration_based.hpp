@@ -24,6 +24,7 @@
 #include <cmath>
 #include <cstdint>
 #include <memory>
+#include <tuple>
 
 namespace nebula::drivers
 {
@@ -146,6 +147,44 @@ public:
 
     return corrected_azimuths;
   }
+
+#ifdef NEBULA_CUDA_ENABLED
+  /// @brief Compute raw angle thresholds needed by the CUDA decoder for FOV filtering
+  /// and overlap detection. These account for per-channel azimuth correction offsets.
+  /// @return (emit_angle_raw, timestamp_reset_angle_raw, fov_start_raw, fov_end_raw)
+  [[nodiscard]] std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>
+  get_cuda_raw_angles(double fov_start_deg, double fov_end_deg, double cut_angle_deg) const
+  {
+    // Find min/max azimuth offset in raw units
+    auto round_away_from_zero = [](float value) -> int32_t {
+      return (value < 0) ? static_cast<int32_t>(std::floor(value))
+                         : static_cast<int32_t>(std::ceil(value));
+    };
+
+    int32_t correction_min = INT32_MAX;
+    int32_t correction_max = INT32_MIN;
+    for (size_t ch = 0; ch < ChannelN; ++ch) {
+      int32_t offset_raw = round_away_from_zero(
+        static_cast<float>(azimuth_offset_rad_[ch] * AngleUnit / deg2rad(1.0)));
+      correction_min = std::min(correction_min, offset_raw);
+      correction_max = std::max(correction_max, offset_raw);
+    }
+
+    int32_t emit_raw = static_cast<int32_t>(std::ceil(cut_angle_deg * AngleUnit)) - correction_min;
+    uint32_t emit_angle_raw = normalize_angle<int32_t>(emit_raw, max_azimuth);
+
+    int32_t fov_start_raw_val =
+      static_cast<int32_t>(std::floor(fov_start_deg * AngleUnit)) - correction_max;
+    uint32_t fov_start_raw = normalize_angle<int32_t>(fov_start_raw_val, max_azimuth);
+
+    int32_t fov_end_raw_val =
+      static_cast<int32_t>(std::ceil(fov_end_deg * AngleUnit)) + correction_max;
+    uint32_t fov_end_raw = normalize_angle<int32_t>(fov_end_raw_val, max_azimuth);
+
+    // For calibration-based sensors, timestamp_reset equals emit angle
+    return {emit_angle_raw, emit_angle_raw, fov_start_raw, fov_end_raw};
+  }
+#endif
 };
 
 }  // namespace nebula::drivers
