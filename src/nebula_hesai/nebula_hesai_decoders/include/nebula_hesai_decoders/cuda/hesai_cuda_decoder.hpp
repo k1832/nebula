@@ -1,4 +1,4 @@
-// Copyright 2024 TIER IV, Inc.
+// Copyright 2026 TIER IV, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -32,8 +32,8 @@ struct CudaNebulaPoint
   float elevation;
   float intensity;
   uint8_t return_type;
-  uint16_t channel;
   uint8_t in_current_scan;  // 1 = belongs to current scan, 0 = belongs to output/next scan
+  uint16_t channel;
   uint32_t entry_id;        // Block group ID for batched processing (used for sorting & filtering)
 };
 
@@ -89,7 +89,6 @@ struct CudaDecoderConfig
   // Multi-frame support for sensors like AT128 (has 4 mirror frames)
   uint32_t n_frames;  // Number of frames (1 for single-frame, 4 for AT128)
   CudaFrameAngleInfo frame_angles[MAX_CUDA_FRAMES];  // Per-frame angle boundaries
-  bool is_multi_frame;  // True if sensor has multiple frames (uses frame_angles)
 };
 
 /// @brief Main CUDA decoder class for Hesai LiDAR
@@ -97,7 +96,7 @@ class HesaiCudaDecoder
 {
 public:
   HesaiCudaDecoder();
-  ~HesaiCudaDecoder();
+  virtual ~HesaiCudaDecoder();
 
   /// @brief Initialize decoder with maximum points and channels
   bool initialize(size_t max_points, uint32_t n_channels);
@@ -126,20 +125,9 @@ private:
 
 extern "C" {
 
-/// @brief Launch kernel to decode a single Hesai packet
-void launch_decode_hesai_packet(
-    const uint16_t* d_distances,
-    const uint8_t* d_reflectivities,
-    const nebula::drivers::cuda::CudaAngleCorrectionData* d_angle_lut,
-    const nebula::drivers::cuda::CudaDecoderConfig& config,
-    nebula::drivers::cuda::CudaNebulaPoint* d_points,
-    uint32_t* d_count,
-    uint32_t n_azimuths,
-    uint32_t raw_azimuth,
-    cudaStream_t stream);
-
 /// @brief Launch batched kernel to decode entire scan
-void launch_decode_hesai_scan_batch(
+/// @return true on success, false on CUDA error
+bool launch_decode_hesai_scan_batch(
     const uint16_t* d_distances_batch,
     const uint8_t* d_reflectivities_batch,
     const uint32_t* d_raw_azimuths,

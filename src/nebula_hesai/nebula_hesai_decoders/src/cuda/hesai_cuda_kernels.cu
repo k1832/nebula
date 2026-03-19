@@ -1,4 +1,4 @@
-// Copyright 2024 TIER IV, Inc.
+// Copyright 2026 TIER IV, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -71,68 +71,6 @@ __device__ __forceinline__ bool cuda_is_inside_overlap_multiframe(
   return false;
 }
 
-// CUDA kernel for decoding a single Hesai LiDAR packet
-__global__ void decode_hesai_packet_kernel(
-  const uint16_t * __restrict__ distances,
-  const uint8_t * __restrict__ reflectivities,
-  const CudaAngleCorrectionData * __restrict__ angle_lut,
-  const CudaDecoderConfig config,
-  CudaNebulaPoint * __restrict__ output_points,
-  uint32_t * __restrict__ output_count,
-  uint32_t n_azimuths,
-  uint32_t raw_azimuth)
-{
-  const uint32_t channel_id = blockIdx.x * blockDim.x + threadIdx.x;
-  const uint32_t block_id = blockIdx.y;
-
-  if (channel_id >= config.n_channels || block_id >= config.n_blocks) {
-    return;
-  }
-
-  const uint32_t data_stride = config.data_stride > 0 ? config.data_stride : config.n_blocks;
-  const uint32_t data_idx = channel_id * data_stride + block_id;
-
-  const uint16_t raw_distance = distances[data_idx];
-  const uint8_t reflectivity = reflectivities[data_idx];
-
-  if (raw_distance == 0) {
-    return;
-  }
-
-  const float distance = static_cast<float>(raw_distance) * config.dis_unit;
-
-  if (distance < config.min_range || distance > config.max_range) {
-    return;
-  }
-
-  if (distance < config.sensor_min_range || distance > config.sensor_max_range) {
-    return;
-  }
-
-  const uint32_t azimuth_idx = (raw_azimuth / config.azimuth_scale) % n_azimuths;
-  const uint32_t lut_idx = azimuth_idx * config.n_channels + channel_id;
-  const CudaAngleCorrectionData angle_data = angle_lut[lut_idx];
-
-  const float xy_distance = distance * angle_data.cos_elevation;
-  const float x = xy_distance * angle_data.sin_azimuth;
-  const float y = xy_distance * angle_data.cos_azimuth;
-  const float z = distance * angle_data.sin_elevation;
-
-  const uint32_t output_idx = atomicAdd(output_count, 1);
-
-  CudaNebulaPoint & out_pt = output_points[output_idx];
-  out_pt.x = x;
-  out_pt.y = y;
-  out_pt.z = z;
-  out_pt.distance = distance;
-  out_pt.azimuth = angle_data.azimuth_rad;
-  out_pt.elevation = angle_data.elevation_rad;
-  out_pt.intensity = static_cast<float>(reflectivity);
-  out_pt.return_type = static_cast<uint8_t>(block_id);
-  out_pt.channel = static_cast<uint16_t>(channel_id);
-  out_pt.entry_id = config.entry_id;
-}
-
 /// @brief Batched kernel for processing an entire scan in one launch
 __global__ void decode_hesai_scan_batch_kernel(
   const uint16_t * __restrict__ d_distances_batch,
@@ -186,7 +124,7 @@ __global__ void decode_hesai_scan_batch_kernel(
   uint8_t in_current_scan = 1;
 
   bool is_in_overlap = false;
-  if (config.is_multi_frame) {
+  if (config.n_frames > 1) {
     is_in_overlap = cuda_is_inside_overlap_multiframe(
       last_azimuth, raw_azimuth, config.frame_angles, config.n_frames, config.n_azimuths_raw);
   } else {
@@ -336,37 +274,8 @@ bool HesaiCudaDecoder::upload_angle_corrections(
 
 }  // namespace nebula::drivers::cuda
 
-// C-linkage wrapper for per-packet kernel
-extern "C" void launch_decode_hesai_packet(
-  const uint16_t * d_distances,
-  const uint8_t * d_reflectivities,
-  const nebula::drivers::cuda::CudaAngleCorrectionData * d_angle_lut,
-  const nebula::drivers::cuda::CudaDecoderConfig & config,
-  nebula::drivers::cuda::CudaNebulaPoint * d_points,
-  uint32_t * d_count,
-  uint32_t n_azimuths,
-  uint32_t raw_azimuth,
-  cudaStream_t stream)
-{
-  const uint32_t threads_per_block = 128;
-  const uint32_t n_blocks_x = (config.n_channels + threads_per_block - 1) / threads_per_block;
-  const uint32_t n_blocks_y = config.n_blocks;
-
-  dim3 grid(n_blocks_x, n_blocks_y);
-  dim3 block(threads_per_block);
-
-  nebula::drivers::cuda::decode_hesai_packet_kernel<<<grid, block, 0, stream>>>(
-    d_distances, d_reflectivities, d_angle_lut, config,
-    d_points, d_count, n_azimuths, raw_azimuth);
-
-  cudaError_t err = cudaGetLastError();
-  if (err != cudaSuccess) {
-    fprintf(stderr, "CUDA kernel launch failed: %s\n", cudaGetErrorString(err));
-  }
-}
-
 // C-linkage wrapper for batched kernel
-extern "C" void launch_decode_hesai_scan_batch(
+extern "C" bool launch_decode_hesai_scan_batch(
   const uint16_t * d_distances_batch,
   const uint8_t * d_reflectivities_batch,
   const uint32_t * d_raw_azimuths,
@@ -391,8 +300,5 @@ extern "C" void launch_decode_hesai_scan_batch(
     d_distances_batch, d_reflectivities_batch, d_raw_azimuths, d_n_returns, d_last_azimuths,
     d_angle_lut, config, d_points, d_count, n_azimuths, n_packets);
 
-  cudaError_t err = cudaGetLastError();
-  if (err != cudaSuccess) {
-    fprintf(stderr, "CUDA batched kernel launch failed: %s\n", cudaGetErrorString(err));
-  }
+  return cudaGetLastError() == cudaSuccess;
 }

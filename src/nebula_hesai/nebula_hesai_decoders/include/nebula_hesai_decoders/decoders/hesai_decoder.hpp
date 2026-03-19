@@ -26,19 +26,8 @@
 #ifdef NEBULA_CUDA_ENABLED
 #include "nebula_hesai_decoders/cuda/hesai_cuda_decoder.hpp"
 
-// C-linkage kernel launcher declarations
-extern "C" void launch_decode_hesai_packet(
-  const uint16_t * d_distances,
-  const uint8_t * d_reflectivities,
-  const nebula::drivers::cuda::CudaAngleCorrectionData * d_angle_lut,
-  const nebula::drivers::cuda::CudaDecoderConfig & config,
-  nebula::drivers::cuda::CudaNebulaPoint * d_points,
-  uint32_t * d_count,
-  uint32_t n_azimuths,
-  uint32_t raw_azimuth,
-  cudaStream_t stream);
-
-extern "C" void launch_decode_hesai_scan_batch(
+// C-linkage kernel launcher declaration (defined in hesai_cuda_kernels.cu)
+extern "C" bool launch_decode_hesai_scan_batch(
   const uint16_t * d_distances_batch,
   const uint8_t * d_reflectivities_batch,
   const uint32_t * d_raw_azimuths,
@@ -328,7 +317,7 @@ private:
     config.max_output_points = n_entries * n_channels * max_returns;
 
     if constexpr (SensorT::uses_calibration_based_angles) {
-      config.is_multi_frame = false;
+      // Single-frame sensor (calibration-based)
       config.n_frames = 1;
       config.timestamp_reset_angle_raw = cuda_timestamp_reset_angle_raw_;
       config.emit_angle_raw = cuda_emit_angle_raw_;
@@ -337,7 +326,7 @@ private:
       config.frame_angles[0].timestamp_reset = cuda_timestamp_reset_angle_raw_;
       config.frame_angles[0].scan_emit = cuda_emit_angle_raw_;
     } else {
-      config.is_multi_frame = true;
+      // Multi-frame sensor (correction-based, e.g. AT128)
       config.n_frames = static_cast<uint32_t>(angle_corrector_.get_n_frames());
       config.timestamp_reset_angle_raw = 0;
       config.emit_angle_raw = 0;
@@ -465,11 +454,14 @@ private:
       d_points_, 0, sparse_buffer_size * sizeof(cuda::CudaNebulaPoint), cuda_stream_);
 
     // Launch batched kernel
-    launch_decode_hesai_scan_batch(
+    bool kernel_ok = launch_decode_hesai_scan_batch(
       gpu_scan_buffer_.d_distances_batch, gpu_scan_buffer_.d_reflectivities_batch,
       gpu_scan_buffer_.d_raw_azimuths, gpu_scan_buffer_.d_n_returns,
       gpu_scan_buffer_.d_last_azimuths, cuda_decoder_->get_angle_lut(), config, d_points_,
       d_count_, cuda_n_azimuths_, n_entries, cuda_stream_);
+    if (!kernel_ok) {
+      NEBULA_LOG_STREAM(logger_->error, "CUDA batched kernel launch failed");
+    }
 
     cudaStreamSynchronize(cuda_stream_);
 

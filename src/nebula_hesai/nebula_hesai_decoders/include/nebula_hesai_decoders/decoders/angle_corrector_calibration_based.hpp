@@ -155,7 +155,9 @@ public:
   [[nodiscard]] std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>
   get_cuda_raw_angles(double fov_start_deg, double fov_end_deg, double cut_angle_deg) const
   {
-    // Find min/max azimuth offset in raw units
+    // Find min/max azimuth offset in raw units.
+    // All values are guaranteed to fit in int32_t: angles are in [0, 360) degrees and
+    // AngleUnit is at most 100 (0.01-degree resolution), so raw values stay within ±36000.
     auto round_away_from_zero = [](float value) -> int32_t {
       return (value < 0) ? static_cast<int32_t>(std::floor(value))
                          : static_cast<int32_t>(std::ceil(value));

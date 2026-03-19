@@ -10,17 +10,12 @@ option(BUILD_CUDA "Build with CUDA support" ON)
 
 # CUDA Configuration
 if(BUILD_CUDA)
-  find_package(CUDA)
-  if(NOT ${CUDA_FOUND})
-    message(WARNING "CUDA not found, building without CUDA support")
+  find_package(CUDAToolkit QUIET)
+  if(NOT CUDAToolkit_FOUND)
+    message(WARNING "CUDA Toolkit not found, building without CUDA support")
     set(BUILD_CUDA OFF)
   else()
-    message(STATUS "CUDA found: ${CUDA_VERSION}")
-    message(STATUS "CUDA include dirs: ${CUDA_INCLUDE_DIRS}")
-
-    # CUDA compiler flags
-    list(APPEND CUDA_NVCC_FLAGS "--expt-relaxed-constexpr")
-    list(APPEND CUDA_NVCC_FLAGS "-diag-suppress 20012")
+    message(STATUS "CUDA Toolkit found: ${CUDAToolkit_VERSION}")
 
     # GPU architectures — set via -DCMAKE_CUDA_ARCHITECTURES on the command line,
     # or fall back to a default set covering Turing through Ada + PTX for forward
@@ -29,14 +24,6 @@ if(BUILD_CUDA)
     if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR CMAKE_CUDA_ARCHITECTURES STREQUAL "")
       set(CMAKE_CUDA_ARCHITECTURES "75;86;87;89" CACHE STRING "CUDA architectures" FORCE)
     endif()
-    # Also emit PTX for the highest arch so the driver can JIT for newer GPUs
-    list(APPEND CUDA_NVCC_FLAGS "-gencode arch=compute_89,code=compute_89")
-
-    # Extended lambda support
-    list(APPEND CUDA_NVCC_FLAGS "--extended-lambda")
-
-    # Optimization flags
-    list(APPEND CUDA_NVCC_FLAGS "-O3")
 
     # Check if CUDA kernel source exists
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/hesai_cuda_kernels.cu")
@@ -69,7 +56,7 @@ target_link_libraries(
 if(BUILD_CUDA AND CUDA_KERNELS_EXIST)
   enable_language(CUDA)
 
-  set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3 --expt-relaxed-constexpr")
+  set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3 -diag-suppress 20012")
 
   add_library(nebula_hesai_decoders_cuda SHARED
     src/cuda/hesai_cuda_kernels.cu
@@ -92,17 +79,20 @@ if(BUILD_CUDA AND CUDA_KERNELS_EXIST)
            $<INSTALL_INTERFACE:include>)
 
   target_link_libraries(nebula_hesai_decoders_cuda
-    PRIVATE cudart)
+    PRIVATE CUDA::cudart_static)
 
   target_compile_definitions(nebula_hesai_decoders_cuda PUBLIC NEBULA_CUDA_ENABLED)
   target_compile_definitions(nebula_hesai_decoders PUBLIC NEBULA_CUDA_ENABLED)
 
   # Add CUDA include directories to main library for header resolution
   target_include_directories(nebula_hesai_decoders
-    PUBLIC ${CUDA_INCLUDE_DIRS})
+    PUBLIC ${CUDAToolkit_INCLUDE_DIRS})
 
-  # Link CUDA library to main library
-  target_link_libraries(nebula_hesai_decoders PUBLIC nebula_hesai_decoders_cuda ${CUDA_LIBRARIES})
+  # Link CUDA library to main library (CUDA::cudart is PRIVATE so it won't
+  # propagate the imported target to downstream packages that lack CUDAToolkit)
+  target_link_libraries(nebula_hesai_decoders
+    PUBLIC nebula_hesai_decoders_cuda
+    PRIVATE CUDA::cudart)
 
   install(TARGETS nebula_hesai_decoders_cuda EXPORT export_nebula_hesai_decoders_cuda)
   ament_export_targets(export_nebula_hesai_decoders_cuda)
