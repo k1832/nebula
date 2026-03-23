@@ -132,6 +132,9 @@ public:
   void read_bag(
     std::function<void(uint64_t, uint64_t, nebula::drivers::NebulaPointCloudPtr)> scan_callback);
 
+  /// @brief Get the underlying driver (for tests that need direct access)
+  std::shared_ptr<drivers::HesaiDriver> get_driver() const { return driver_ptr_; }
+
   HesaiRosDecoderTestParams params_;
 };
 

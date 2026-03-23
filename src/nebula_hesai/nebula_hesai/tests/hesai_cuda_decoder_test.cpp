@@ -34,15 +34,34 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <string>
 #include <vector>
 
 #ifdef NEBULA_CUDA_ENABLED
+#include <nebula_hesai_decoders/cuda/hesai_cuda_decoder.hpp>
+
+#include <cuda_runtime.h>
+#endif
+
+#ifdef NEBULA_CUDA_ENABLED
 
 namespace nebula::test
 {
+
+/// @brief Check if a CUDA-capable GPU is available at runtime
+static bool has_cuda_device()
+{
+  cudaStream_t stream = nullptr;
+  cudaError_t err = cudaStreamCreate(&stream);
+  if (err == cudaSuccess) {
+    cudaStreamDestroy(stream);
+    return true;
+  }
+  return false;
+}
 
 // OT128 config — matches TEST_CONFIGS[8] in hesai_ros_decoder_test_main.cpp
 static const nebula::ros::HesaiRosDecoderTestParams OT128_CONFIG = {
@@ -262,6 +281,188 @@ TEST(HesaiCudaDecoderTest, OT128_IntensityExactMatch)
   }
 }
 
+// ---------------------------------------------------------------------------
+// Test 6 (zero-copy): GPU pipeline mode produces empty CPU cloud
+// ---------------------------------------------------------------------------
+TEST(HesaiCudaDecoderTest, OT128_GpuPipelineSkipsCpuOutput)
+{
+  if (!has_cuda_device()) {
+    GTEST_SKIP() << "No CUDA-capable GPU available";
+  }
+
+  setenv("NEBULA_USE_CUDA", "1", 1);
+  setenv("NEBULA_GPU_PIPELINE", "1", 1);
+
+  rclcpp::NodeOptions options;
+  auto driver =
+    std::make_shared<nebula::ros::HesaiRosDecoderTest>(options, "cuda_test_node", OT128_CONFIG);
+  ASSERT_EQ(driver->get_status(), nebula::Status::OK);
+
+  size_t callback_count = 0;
+  size_t non_empty_count = 0;
+  auto cb =
+    [&](uint64_t /*msg_ts*/, uint64_t /*scan_ts*/, nebula::drivers::NebulaPointCloudPtr cloud) {
+      ++callback_count;
+      if (cloud && !cloud->empty()) {
+        ++non_empty_count;
+      }
+    };
+  driver->read_bag(cb);
+
+  unsetenv("NEBULA_GPU_PIPELINE");
+
+  // In GPU pipeline mode, process_gpu_results() is skipped so CPU clouds should be empty.
+  // Callbacks still fire (scan completion is detected), but the pointcloud is not populated.
+  EXPECT_GT(callback_count, 0u) << "No scan callbacks fired";
+  EXPECT_EQ(non_empty_count, 0u) << "Expected empty CPU clouds in GPU pipeline mode, but "
+                                 << non_empty_count << "/" << callback_count << " were non-empty";
+}
+
+// ---------------------------------------------------------------------------
+// Test 7 (zero-copy): get_gpu_pointcloud() returns valid data
+// ---------------------------------------------------------------------------
+TEST(HesaiCudaDecoderTest, OT128_GpuPointCloudApiValid)
+{
+  if (!has_cuda_device()) {
+    GTEST_SKIP() << "No CUDA-capable GPU available";
+  }
+
+  setenv("NEBULA_USE_CUDA", "1", 1);
+  setenv("NEBULA_GPU_PIPELINE", "1", 1);
+
+  rclcpp::NodeOptions options;
+  auto driver =
+    std::make_shared<nebula::ros::HesaiRosDecoderTest>(options, "cuda_test_node", OT128_CONFIG);
+  ASSERT_EQ(driver->get_status(), nebula::Status::OK);
+
+  auto hesai_driver = driver->get_driver();
+  ASSERT_NE(hesai_driver, nullptr);
+  EXPECT_TRUE(hesai_driver->is_gpu_pipeline_mode());
+
+  // Track GpuPointCloud results across scan completions
+  std::vector<nebula::drivers::cuda::GpuPointCloud> gpu_clouds;
+  auto cb =
+    [&](uint64_t /*msg_ts*/, uint64_t /*scan_ts*/, nebula::drivers::NebulaPointCloudPtr /*cloud*/) {
+      auto gpu_pc = hesai_driver->get_gpu_pointcloud();
+      gpu_clouds.push_back(gpu_pc);
+    };
+  driver->read_bag(cb);
+
+  unsetenv("NEBULA_GPU_PIPELINE");
+
+  ASSERT_GT(gpu_clouds.size(), 0u) << "No scans produced";
+
+  for (size_t i = 0; i < gpu_clouds.size(); ++i) {
+    const auto & gpc = gpu_clouds[i];
+    EXPECT_TRUE(gpc.valid) << "Scan " << i << ": GpuPointCloud not valid";
+    EXPECT_GT(gpc.point_count, 0u) << "Scan " << i << ": zero point count";
+    EXPECT_NE(gpc.d_points, nullptr) << "Scan " << i << ": null device pointer";
+    EXPECT_GT(gpc.timestamp_ns, 0u) << "Scan " << i << ": zero timestamp";
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Test 8 (zero-copy): PointCloud2 conversion kernel produces correct layout
+// ---------------------------------------------------------------------------
+TEST(HesaiCudaDecoderTest, PointCloud2ConversionKernel)
+{
+  if (!has_cuda_device()) {
+    GTEST_SKIP() << "No CUDA-capable GPU available";
+  }
+
+  using nebula::drivers::cuda::CudaNebulaPoint;
+  using nebula::drivers::cuda::POINTCLOUD2_POINT_STEP;
+
+  // Create test points on host
+  const uint32_t n_points = 3;
+  std::vector<CudaNebulaPoint> h_points(n_points);
+
+  // Point 0: valid, in current scan
+  h_points[0] = {1.0f, 2.0f, 3.0f, 5.0f, 0.1f, 0.2f, 128.0f, 1, 1, 42, 0};
+  // Point 1: valid, in current scan
+  h_points[1] = {-1.0f, -2.0f, -3.0f, 4.0f, 0.3f, 0.4f, 255.0f, 2, 1, 7, 1};
+  // Point 2: invalid (distance = 0), should be filtered out
+  h_points[2] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0, 1, 0, 2};
+
+  // Allocate device memory
+  CudaNebulaPoint * d_input = nullptr;
+  uint8_t * d_output = nullptr;
+  uint32_t * d_count = nullptr;
+  cudaMalloc(&d_input, n_points * sizeof(CudaNebulaPoint));
+  cudaMalloc(&d_output, n_points * POINTCLOUD2_POINT_STEP);
+  cudaMalloc(&d_count, sizeof(uint32_t));
+
+  cudaMemcpy(d_input, h_points.data(), n_points * sizeof(CudaNebulaPoint), cudaMemcpyHostToDevice);
+
+  // Run conversion kernel
+  bool ok = launch_convert_to_pointcloud2(d_input, d_output, d_count, n_points, true, nullptr);
+  ASSERT_TRUE(ok) << "Kernel launch failed";
+  cudaDeviceSynchronize();
+
+  // Read back count
+  uint32_t output_count = 0;
+  cudaMemcpy(&output_count, d_count, sizeof(uint32_t), cudaMemcpyDeviceToHost);
+  EXPECT_EQ(output_count, 2u) << "Expected 2 valid points (point 2 has distance=0)";
+
+  // Read back PointCloud2 data
+  std::vector<uint8_t> h_output(output_count * POINTCLOUD2_POINT_STEP);
+  cudaMemcpy(h_output.data(), d_output, h_output.size(), cudaMemcpyDeviceToHost);
+
+  // Verify layout for both output points (order is nondeterministic due to atomicAdd)
+  // Collect the output points and verify they match input points 0 and 1
+  std::vector<float> out_x_vals;
+  for (uint32_t i = 0; i < output_count; ++i) {
+    const uint8_t * p = h_output.data() + i * POINTCLOUD2_POINT_STEP;
+    float x, y, z, azimuth, elevation, distance;
+    uint8_t intensity, return_type;
+    uint16_t channel;
+
+    std::memcpy(&x, p + 0, sizeof(float));
+    std::memcpy(&y, p + 4, sizeof(float));
+    std::memcpy(&z, p + 8, sizeof(float));
+    intensity = p[12];
+    return_type = p[13];
+    std::memcpy(&channel, p + 14, sizeof(uint16_t));
+    std::memcpy(&azimuth, p + 16, sizeof(float));
+    std::memcpy(&elevation, p + 20, sizeof(float));
+    std::memcpy(&distance, p + 24, sizeof(float));
+
+    out_x_vals.push_back(x);
+
+    // Find which input point this corresponds to
+    if (std::abs(x - 1.0f) < 1e-5f) {
+      // Should be point 0
+      EXPECT_FLOAT_EQ(y, 2.0f);
+      EXPECT_FLOAT_EQ(z, 3.0f);
+      EXPECT_EQ(intensity, 128u);
+      EXPECT_EQ(return_type, 1u);
+      EXPECT_EQ(channel, 42u);
+      EXPECT_FLOAT_EQ(distance, 5.0f);
+      EXPECT_FLOAT_EQ(azimuth, 0.1f);
+      EXPECT_FLOAT_EQ(elevation, 0.2f);
+    } else if (std::abs(x - (-1.0f)) < 1e-5f) {
+      // Should be point 1
+      EXPECT_FLOAT_EQ(y, -2.0f);
+      EXPECT_FLOAT_EQ(z, -3.0f);
+      EXPECT_EQ(intensity, 255u);
+      EXPECT_EQ(return_type, 2u);
+      EXPECT_EQ(channel, 7u);
+      EXPECT_FLOAT_EQ(distance, 4.0f);
+      EXPECT_FLOAT_EQ(azimuth, 0.3f);
+      EXPECT_FLOAT_EQ(elevation, 0.4f);
+    } else {
+      ADD_FAILURE() << "Unexpected point with x=" << x;
+    }
+  }
+
+  // Both input points should appear in output
+  EXPECT_EQ(out_x_vals.size(), 2u);
+
+  cudaFree(d_input);
+  cudaFree(d_output);
+  cudaFree(d_count);
+}
+
 }  // namespace nebula::test
 
 #else  // !NEBULA_CUDA_ENABLED
@@ -280,6 +481,7 @@ int main(int argc, char * argv[])
   int result = RUN_ALL_TESTS();
   // Restore env
   unsetenv("NEBULA_USE_CUDA");
+  unsetenv("NEBULA_GPU_PIPELINE");
   rclcpp::shutdown();
   return result;
 }

@@ -9,6 +9,13 @@ if("$ENV{ENABLE_AGNOCAST}" AND NOT agnocastlib_FOUND)
   message(FATAL_ERROR "agnocastlib is required when Agnocast is enabled")
 endif()
 
+# Optional CUDA blackboard for zero-copy GPU pipeline
+find_package(cuda_blackboard QUIET)
+if(cuda_blackboard_FOUND AND TARGET nebula_hesai_decoders_cuda)
+  message(STATUS "cuda_blackboard found - GPU zero-copy pipeline available")
+  add_definitions(-DCUDA_BLACKBOARD_AVAILABLE)
+endif()
+
 # Hesai
 add_library(
   hesai_ros_wrapper SHARED
@@ -44,6 +51,10 @@ if("$ENV{ENABLE_AGNOCAST}")
   message("Agnocast support is enabled")
   ament_target_dependencies(hesai_ros_wrapper PUBLIC agnocastlib)
   add_definitions(-DUSE_AGNOCAST_ENABLED)
+endif()
+
+if(cuda_blackboard_FOUND AND TARGET nebula_hesai_decoders_cuda)
+  ament_target_dependencies(hesai_ros_wrapper PUBLIC cuda_blackboard)
 endif()
 
 rclcpp_components_register_node(hesai_ros_wrapper PLUGIN "HesaiRosWrapper"
@@ -121,6 +132,10 @@ if(BUILD_TESTING)
     nebula_hesai_common::nebula_hesai_common
     nebula_hesai_decoders::nebula_hesai_decoders
     diagnostic_updater::diagnostic_updater)
+  find_package(CUDAToolkit QUIET)
+  if(CUDAToolkit_FOUND)
+    target_link_libraries(hesai_cuda_decoder_test_main CUDA::cudart)
+  endif()
 endif()
 
 if(BUILD_EXAMPLES)

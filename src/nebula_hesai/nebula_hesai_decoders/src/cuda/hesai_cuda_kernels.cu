@@ -289,3 +289,120 @@ extern "C" bool launch_decode_hesai_scan_batch(
 
   return cudaGetLastError() == cudaSuccess;
 }
+
+// =============================================================================
+// FORMAT CONVERSION KERNELS FOR ZERO-COPY PIPELINE
+// Converts CudaNebulaPoint[] to PointCloud2-compatible byte layout (PointXYZIRCAEDT)
+// =============================================================================
+
+namespace nebula::drivers::cuda
+{
+
+// PointXYZIRCAEDT field offsets (32 bytes total)
+constexpr uint32_t PC2_OFFSET_X = 0;
+constexpr uint32_t PC2_OFFSET_Y = 4;
+constexpr uint32_t PC2_OFFSET_Z = 8;
+constexpr uint32_t PC2_OFFSET_INTENSITY = 12;
+constexpr uint32_t PC2_OFFSET_RETURN_TYPE = 13;
+constexpr uint32_t PC2_OFFSET_CHANNEL = 14;
+constexpr uint32_t PC2_OFFSET_AZIMUTH = 16;
+constexpr uint32_t PC2_OFFSET_ELEVATION = 20;
+constexpr uint32_t PC2_OFFSET_DISTANCE = 24;
+constexpr uint32_t PC2_OFFSET_TIME_STAMP = 28;
+constexpr uint32_t PC2_POINT_STEP = 32;
+
+__global__ void convert_to_pointcloud2_kernel(
+  const CudaNebulaPoint * __restrict__ d_input, uint8_t * __restrict__ d_output,
+  uint32_t * __restrict__ d_output_count, const uint32_t input_count,
+  const bool filter_current_scan)
+{
+  const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= input_count) return;
+
+  const CudaNebulaPoint & pt = d_input[idx];
+
+  if (filter_current_scan && !pt.in_current_scan) return;
+  if (pt.distance <= 0.0f) return;
+
+  const uint32_t out_idx = atomicAdd(d_output_count, 1);
+  uint8_t * out = d_output + out_idx * PC2_POINT_STEP;
+
+  *reinterpret_cast<float *>(out + PC2_OFFSET_X) = pt.x;
+  *reinterpret_cast<float *>(out + PC2_OFFSET_Y) = pt.y;
+  *reinterpret_cast<float *>(out + PC2_OFFSET_Z) = pt.z;
+  out[PC2_OFFSET_INTENSITY] = static_cast<uint8_t>(fminf(fmaxf(pt.intensity, 0.0f), 255.0f));
+  out[PC2_OFFSET_RETURN_TYPE] = pt.return_type;
+  *reinterpret_cast<uint16_t *>(out + PC2_OFFSET_CHANNEL) = pt.channel;
+  *reinterpret_cast<float *>(out + PC2_OFFSET_AZIMUTH) = pt.azimuth;
+  *reinterpret_cast<float *>(out + PC2_OFFSET_ELEVATION) = pt.elevation;
+  *reinterpret_cast<float *>(out + PC2_OFFSET_DISTANCE) = pt.distance;
+  *reinterpret_cast<uint32_t *>(out + PC2_OFFSET_TIME_STAMP) = 0;
+}
+
+__global__ void convert_to_pointcloud2_ordered_kernel(
+  const CudaNebulaPoint * __restrict__ d_input, uint8_t * __restrict__ d_output,
+  uint8_t * __restrict__ d_valid_mask, const uint32_t input_count, const bool filter_current_scan)
+{
+  const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= input_count) return;
+
+  const CudaNebulaPoint & pt = d_input[idx];
+  uint8_t * out = d_output + idx * PC2_POINT_STEP;
+
+  bool valid = (!filter_current_scan || pt.in_current_scan) && pt.distance > 0.0f;
+
+  if (d_valid_mask) {
+    d_valid_mask[idx] = valid ? 1 : 0;
+  }
+
+  if (!valid) {
+    memset(out, 0, PC2_POINT_STEP);
+    return;
+  }
+
+  *reinterpret_cast<float *>(out + PC2_OFFSET_X) = pt.x;
+  *reinterpret_cast<float *>(out + PC2_OFFSET_Y) = pt.y;
+  *reinterpret_cast<float *>(out + PC2_OFFSET_Z) = pt.z;
+  out[PC2_OFFSET_INTENSITY] = static_cast<uint8_t>(fminf(fmaxf(pt.intensity, 0.0f), 255.0f));
+  out[PC2_OFFSET_RETURN_TYPE] = pt.return_type;
+  *reinterpret_cast<uint16_t *>(out + PC2_OFFSET_CHANNEL) = pt.channel;
+  *reinterpret_cast<float *>(out + PC2_OFFSET_AZIMUTH) = pt.azimuth;
+  *reinterpret_cast<float *>(out + PC2_OFFSET_ELEVATION) = pt.elevation;
+  *reinterpret_cast<float *>(out + PC2_OFFSET_DISTANCE) = pt.distance;
+  *reinterpret_cast<uint32_t *>(out + PC2_OFFSET_TIME_STAMP) = 0;
+}
+
+}  // namespace nebula::drivers::cuda
+
+extern "C" bool launch_convert_to_pointcloud2(
+  const nebula::drivers::cuda::CudaNebulaPoint * d_input, uint8_t * d_output,
+  uint32_t * d_output_count, uint32_t input_count, bool filter_current_scan, cudaStream_t stream)
+{
+  if (input_count == 0) return true;
+
+  cudaMemsetAsync(d_output_count, 0, sizeof(uint32_t), stream);
+
+  const uint32_t threads_per_block = 256;
+  const uint32_t n_blocks = (input_count + threads_per_block - 1) / threads_per_block;
+
+  nebula::drivers::cuda::convert_to_pointcloud2_kernel<<<n_blocks, threads_per_block, 0, stream>>>(
+    d_input, d_output, d_output_count, input_count, filter_current_scan);
+
+  return cudaGetLastError() == cudaSuccess;
+}
+
+extern "C" bool launch_convert_to_pointcloud2_ordered(
+  const nebula::drivers::cuda::CudaNebulaPoint * d_input, uint8_t * d_output,
+  uint8_t * d_valid_mask, uint32_t input_count, bool filter_current_scan, cudaStream_t stream)
+{
+  if (input_count == 0) return true;
+
+  const uint32_t threads_per_block = 256;
+  const uint32_t n_blocks = (input_count + threads_per_block - 1) / threads_per_block;
+
+  nebula::drivers::cuda::
+    convert_to_pointcloud2_ordered_kernel<<<n_blocks, threads_per_block, 0, stream>>>(
+      d_input, d_output, d_valid_mask, input_count, filter_current_scan);
+
+  return cudaGetLastError() == cudaSuccess;
+}

@@ -221,6 +221,13 @@ private:
   /// @brief Whether this is a multi-frame sensor (e.g., AT128 with 4 mirror frames)
   bool is_multi_frame_sensor_ = false;
 
+  /// @brief GPU pipeline mode: skip D2H, expose points on GPU for zero-copy downstream
+  bool gpu_pipeline_mode_ = false;
+  /// @brief Valid point count from last GPU decode (for get_gpu_pointcloud())
+  uint32_t gpu_output_point_count_ = 0;
+  /// @brief Scan timestamp from last GPU decode (for get_gpu_pointcloud())
+  uint64_t gpu_output_timestamp_ns_ = 0;
+
 #endif  // NEBULA_CUDA_ENABLED
 
   /// @brief Validates and parse PandarPacket. Checks size and, if present, CRC checksums.
@@ -464,7 +471,13 @@ private:
       return;
     }
 
-    process_gpu_results(completed_buffer_index, n_entries, sparse_buffer_size);
+    if (gpu_pipeline_mode_) {
+      // Zero-copy: skip D2H, store metadata for get_gpu_pointcloud()
+      gpu_output_point_count_ = sparse_buffer_size;
+      gpu_output_timestamp_ns_ = frame_buffers_[completed_buffer_index].scan_timestamp_ns;
+    } else {
+      process_gpu_results(completed_buffer_index, n_entries, sparse_buffer_size);
+    }
 
     gpu_scan_buffer_.packet_count = 0;
   }
@@ -697,6 +710,13 @@ private:
       size_t n_frames = angle_corrector_.get_n_frames();
       NEBULA_LOG_STREAM(
         logger_->info, "CUDA: Detected multi-frame sensor with " << n_frames << " frames");
+    }
+
+    // Check for GPU pipeline mode (zero-copy: skip D2H, expose points on device)
+    const char * gpu_pipeline_env = std::getenv("NEBULA_GPU_PIPELINE");
+    if (gpu_pipeline_env && std::string(gpu_pipeline_env) == "1") {
+      gpu_pipeline_mode_ = true;
+      NEBULA_LOG_STREAM(logger_->info, "GPU pipeline mode enabled (zero-copy)");
     }
 
     cuda_enabled_ = true;
@@ -979,6 +999,18 @@ public:
   {
     pointcloud_callback_ = std::move(callback);
   }
+
+#ifdef NEBULA_CUDA_ENABLED
+  cuda::GpuPointCloud get_gpu_pointcloud() const override
+  {
+    if (!cuda_enabled_ || !gpu_pipeline_mode_ || gpu_output_point_count_ == 0) {
+      return cuda::GpuPointCloud{};
+    }
+    return cuda::GpuPointCloud{d_points_, gpu_output_point_count_, gpu_output_timestamp_ns_, true};
+  }
+
+  bool is_gpu_pipeline_mode() const override { return cuda_enabled_ && gpu_pipeline_mode_; }
+#endif
 
   PacketDecodeResult unpack(const std::vector<uint8_t> & packet) override
   {
