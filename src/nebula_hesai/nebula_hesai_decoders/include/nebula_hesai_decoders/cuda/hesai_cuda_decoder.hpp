@@ -15,6 +15,7 @@
 #pragma once
 
 #include <cuda_runtime.h>
+
 #include <cstdint>
 #include <vector>
 
@@ -34,7 +35,7 @@ struct CudaNebulaPoint
   uint8_t return_type;
   uint8_t in_current_scan;  // 1 = belongs to current scan, 0 = belongs to output/next scan
   uint16_t channel;
-  uint32_t entry_id;        // Block group ID for batched processing (used for sorting & filtering)
+  uint32_t entry_id;  // Block group ID for batched processing (used for sorting & filtering)
 };
 
 /// @brief Angle correction data for CUDA lookup table
@@ -80,7 +81,7 @@ struct CudaDecoderConfig
   // Overlap detection parameters (raw azimuth in 0.01 degree units)
   uint32_t timestamp_reset_angle_raw;
   uint32_t emit_angle_raw;
-  uint32_t n_azimuths_raw;  // Total azimuth count (e.g., 36000 for 0.01 deg resolution)
+  uint32_t n_azimuths_raw;     // Total azimuth count (e.g., 36000 for 0.01 deg resolution)
   uint32_t max_output_points;  // Maximum output buffer size for sparse indexing (batched mode)
 
   // Azimuth scaling for sensors with different degree_subdivisions
@@ -103,8 +104,7 @@ public:
 
   /// @brief Upload angle correction lookup table to GPU
   bool upload_angle_corrections(
-    const std::vector<CudaAngleCorrectionData> & angle_lut,
-    uint32_t n_azimuths,
+    const std::vector<CudaAngleCorrectionData> & angle_lut, uint32_t n_azimuths,
     uint32_t n_channels);
 
   /// @brief Get device pointer to angle lookup table
@@ -128,17 +128,11 @@ extern "C" {
 /// @brief Launch batched kernel to decode entire scan
 /// @return true on success, false on CUDA error
 bool launch_decode_hesai_scan_batch(
-    const uint16_t* d_distances_batch,
-    const uint8_t* d_reflectivities_batch,
-    const uint32_t* d_raw_azimuths,
-    const uint32_t* d_n_returns,
-    const uint32_t* d_last_azimuths,
-    const nebula::drivers::cuda::CudaAngleCorrectionData* d_angle_lut,
-    const nebula::drivers::cuda::CudaDecoderConfig& config,
-    nebula::drivers::cuda::CudaNebulaPoint* d_points,
-    uint32_t* d_count,
-    uint32_t n_azimuths,
-    uint32_t n_packets,
-    cudaStream_t stream);
+  const uint16_t * d_distances_batch, const uint8_t * d_reflectivities_batch,
+  const uint32_t * d_raw_azimuths, const uint32_t * d_n_returns, const uint32_t * d_last_azimuths,
+  const nebula::drivers::cuda::CudaAngleCorrectionData * d_angle_lut,
+  const nebula::drivers::cuda::CudaDecoderConfig & config,
+  nebula::drivers::cuda::CudaNebulaPoint * d_points, uint32_t * d_count, uint32_t n_azimuths,
+  uint32_t n_packets, cudaStream_t stream);
 
 }  // extern "C"

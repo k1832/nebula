@@ -15,6 +15,7 @@
 #include "nebula_hesai_decoders/cuda/hesai_cuda_decoder.hpp"
 
 #include <cuda_runtime.h>
+
 #include <cstdio>
 #include <cstring>
 
@@ -48,8 +49,8 @@ __device__ __forceinline__ bool cuda_angle_is_between_raw(
 
 // Device function: Check if we're inside the overlap region (single-frame version)
 __device__ __forceinline__ bool cuda_is_inside_overlap(
-  uint32_t last_azimuth, uint32_t current_azimuth,
-  uint32_t timestamp_reset_angle, uint32_t emit_angle, uint32_t max_angle)
+  uint32_t last_azimuth, uint32_t current_azimuth, uint32_t timestamp_reset_angle,
+  uint32_t emit_angle, uint32_t max_angle)
 {
   return cuda_angle_is_between_raw(timestamp_reset_angle, emit_angle, current_azimuth, max_angle) ||
          cuda_angle_is_between_raw(timestamp_reset_angle, emit_angle, last_azimuth, max_angle);
@@ -57,14 +58,15 @@ __device__ __forceinline__ bool cuda_is_inside_overlap(
 
 // Device function: Check if we're inside the overlap region for multi-frame sensors (AT128)
 __device__ __forceinline__ bool cuda_is_inside_overlap_multiframe(
-  uint32_t last_azimuth, uint32_t current_azimuth,
-  const CudaFrameAngleInfo* frame_angles, uint32_t n_frames, uint32_t max_angle)
+  uint32_t last_azimuth, uint32_t current_azimuth, const CudaFrameAngleInfo * frame_angles,
+  uint32_t n_frames, uint32_t max_angle)
 {
   for (uint32_t i = 0; i < n_frames; ++i) {
-    if (cuda_angle_is_between_raw(frame_angles[i].timestamp_reset, frame_angles[i].scan_emit,
-                                  current_azimuth, max_angle) ||
-        cuda_angle_is_between_raw(frame_angles[i].timestamp_reset, frame_angles[i].scan_emit,
-                                  last_azimuth, max_angle)) {
+    if (
+      cuda_angle_is_between_raw(
+        frame_angles[i].timestamp_reset, frame_angles[i].scan_emit, current_azimuth, max_angle) ||
+      cuda_angle_is_between_raw(
+        frame_angles[i].timestamp_reset, frame_angles[i].scan_emit, last_azimuth, max_angle)) {
       return true;
     }
   }
@@ -74,16 +76,11 @@ __device__ __forceinline__ bool cuda_is_inside_overlap_multiframe(
 /// @brief Batched kernel for processing an entire scan in one launch
 __global__ void decode_hesai_scan_batch_kernel(
   const uint16_t * __restrict__ d_distances_batch,
-  const uint8_t * __restrict__ d_reflectivities_batch,
-  const uint32_t * __restrict__ d_raw_azimuths,
-  const uint32_t * __restrict__ d_n_returns,
-  const uint32_t * __restrict__ d_last_azimuths,
-  const CudaAngleCorrectionData * __restrict__ angle_lut,
-  const CudaDecoderConfig config,
-  CudaNebulaPoint * __restrict__ output_points,
-  uint32_t * __restrict__ output_count,
-  uint32_t n_azimuths,
-  uint32_t n_packets)
+  const uint8_t * __restrict__ d_reflectivities_batch, const uint32_t * __restrict__ d_raw_azimuths,
+  const uint32_t * __restrict__ d_n_returns, const uint32_t * __restrict__ d_last_azimuths,
+  const CudaAngleCorrectionData * __restrict__ angle_lut, const CudaDecoderConfig config,
+  CudaNebulaPoint * __restrict__ output_points, uint32_t * __restrict__ output_count,
+  uint32_t n_azimuths, uint32_t n_packets)
 {
   const uint32_t global_tid = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -96,8 +93,8 @@ __global__ void decode_hesai_scan_batch_kernel(
 
   if (return_id >= d_n_returns[packet_id]) return;
 
-  const uint32_t data_idx = packet_id * (config.n_channels * config.max_returns)
-                           + channel_id * config.max_returns + return_id;
+  const uint32_t data_idx = packet_id * (config.n_channels * config.max_returns) +
+                            channel_id * config.max_returns + return_id;
 
   const uint16_t raw_distance = d_distances_batch[data_idx];
   const uint8_t reflectivity = d_reflectivities_batch[data_idx];
@@ -115,8 +112,8 @@ __global__ void decode_hesai_scan_batch_kernel(
   const CudaAngleCorrectionData angle_data = angle_lut[lut_idx];
 
   // FOV filtering
-  const bool in_fov = cuda_angle_is_between(config.fov_min_rad, config.fov_max_rad,
-                                            angle_data.azimuth_rad);
+  const bool in_fov =
+    cuda_angle_is_between(config.fov_min_rad, config.fov_max_rad, angle_data.azimuth_rad);
   if (!in_fov) return;
 
   // Overlap/scan assignment
@@ -149,8 +146,8 @@ __global__ void decode_hesai_scan_batch_kernel(
   }
 
   {
-    const uint32_t group_base = packet_id * (config.n_channels * config.max_returns)
-                               + channel_id * config.max_returns;
+    const uint32_t group_base =
+      packet_id * (config.n_channels * config.max_returns) + channel_id * config.max_returns;
     const float threshold = config.dual_return_distance_threshold;
 
     if (n_returns == 2) {
@@ -212,10 +209,7 @@ compute_coordinates:
 
 // Constructor
 HesaiCudaDecoder::HesaiCudaDecoder()
-: d_angle_lut_(nullptr),
-  n_azimuths_(0),
-  n_channels_(0),
-  initialized_(false)
+: d_angle_lut_(nullptr), n_azimuths_(0), n_channels_(0), initialized_(false)
 {
 }
 
@@ -236,13 +230,12 @@ bool HesaiCudaDecoder::initialize(size_t max_points, uint32_t n_channels)
 }
 
 bool HesaiCudaDecoder::upload_angle_corrections(
-  const std::vector<CudaAngleCorrectionData> & angle_lut,
-  uint32_t n_azimuths,
-  uint32_t n_channels)
+  const std::vector<CudaAngleCorrectionData> & angle_lut, uint32_t n_azimuths, uint32_t n_channels)
 {
   if (angle_lut.size() != n_azimuths * n_channels) {
-    fprintf(stderr, "CUDA: Angle LUT size mismatch: %zu vs expected %u\n",
-            angle_lut.size(), n_azimuths * n_channels);
+    fprintf(
+      stderr, "CUDA: Angle LUT size mismatch: %zu vs expected %u\n", angle_lut.size(),
+      n_azimuths * n_channels);
     return false;
   }
 
@@ -276,18 +269,12 @@ bool HesaiCudaDecoder::upload_angle_corrections(
 
 // C-linkage wrapper for batched kernel
 extern "C" bool launch_decode_hesai_scan_batch(
-  const uint16_t * d_distances_batch,
-  const uint8_t * d_reflectivities_batch,
-  const uint32_t * d_raw_azimuths,
-  const uint32_t * d_n_returns,
-  const uint32_t * d_last_azimuths,
+  const uint16_t * d_distances_batch, const uint8_t * d_reflectivities_batch,
+  const uint32_t * d_raw_azimuths, const uint32_t * d_n_returns, const uint32_t * d_last_azimuths,
   const nebula::drivers::cuda::CudaAngleCorrectionData * d_angle_lut,
   const nebula::drivers::cuda::CudaDecoderConfig & config,
-  nebula::drivers::cuda::CudaNebulaPoint * d_points,
-  uint32_t * d_count,
-  uint32_t n_azimuths,
-  uint32_t n_packets,
-  cudaStream_t stream)
+  nebula::drivers::cuda::CudaNebulaPoint * d_points, uint32_t * d_count, uint32_t n_azimuths,
+  uint32_t n_packets, cudaStream_t stream)
 {
   const uint32_t total_work = n_packets * config.n_channels * config.max_returns;
   const uint32_t threads_per_block = 256;

@@ -152,8 +152,8 @@ public:
   /// @brief Compute raw angle thresholds needed by the CUDA decoder for FOV filtering
   /// and overlap detection. These account for per-channel azimuth correction offsets.
   /// @return (emit_angle_raw, timestamp_reset_angle_raw, fov_start_raw, fov_end_raw)
-  [[nodiscard]] std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>
-  get_cuda_raw_angles(double fov_start_deg, double fov_end_deg, double cut_angle_deg) const
+  [[nodiscard]] std::tuple<uint32_t, uint32_t, uint32_t, uint32_t> get_cuda_raw_angles(
+    double fov_start_deg, double fov_end_deg, double cut_angle_deg) const
   {
     // Find min/max azimuth offset in raw units.
     // All values are guaranteed to fit in int32_t: angles are in [0, 360) degrees and

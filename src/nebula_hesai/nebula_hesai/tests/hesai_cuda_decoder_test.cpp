@@ -45,8 +45,17 @@ namespace nebula::test
 
 // OT128 config — matches TEST_CONFIGS[8] in hesai_ros_decoder_test_main.cpp
 static const nebula::ros::HesaiRosDecoderTestParams OT128_CONFIG = {
-  "Pandar128E4X", "LastStrongest", "Pandar128E4X.csv", "ot128/1730271167765338806",
-  "hesai", 0, 0.0, 0., 360., 0.3f, 300.f};
+  "Pandar128E4X",
+  "LastStrongest",
+  "Pandar128E4X.csv",
+  "ot128/1730271167765338806",
+  "hesai",
+  0,
+  0.0,
+  0.,
+  360.,
+  0.3f,
+  300.f};
 
 // Maximum allowed difference in point count between GPU and CPU per scan.
 // The GPU kernel assigns scan-boundary points differently than the CPU's ScanCutter,
@@ -81,13 +90,12 @@ static std::vector<DecodedScan> decode_bag(
   }
 
   rclcpp::NodeOptions options;
-  auto driver = std::make_shared<nebula::ros::HesaiRosDecoderTest>(
-    options, "cuda_test_node", params);
+  auto driver =
+    std::make_shared<nebula::ros::HesaiRosDecoderTest>(options, "cuda_test_node", params);
   EXPECT_EQ(driver->get_status(), nebula::Status::OK);
 
   std::vector<DecodedScan> scans;
-  auto cb = [&](uint64_t msg_ts, uint64_t /*scan_ts*/,
-                nebula::drivers::NebulaPointCloudPtr cloud) {
+  auto cb = [&](uint64_t msg_ts, uint64_t /*scan_ts*/, nebula::drivers::NebulaPointCloudPtr cloud) {
     if (cloud && !cloud->empty()) {
       // Deep-copy: the decoder reuses its internal buffer after the callback returns
       auto copy = std::make_shared<nebula::drivers::NebulaPointCloud>(*cloud);
@@ -99,8 +107,7 @@ static std::vector<DecodedScan> decode_bag(
 }
 
 /// Squared Euclidean distance between two points
-static float sq_dist(
-  const nebula::drivers::NebulaPoint & a, const nebula::drivers::NebulaPoint & b)
+static float sq_dist(const nebula::drivers::NebulaPoint & a, const nebula::drivers::NebulaPoint & b)
 {
   float dx = a.x - b.x;
   float dy = a.y - b.y;
@@ -247,8 +254,7 @@ TEST(HesaiCudaDecoderTest, OT128_IntensityExactMatch)
     // A small fraction (<1%) may differ at scan boundaries where the GPU kernel
     // selects a different return than the CPU's dual-return filtering.
     EXPECT_GT(checked, 0u) << "Scan " << i << ": no tight matches found";
-    double mismatch_ratio =
-      checked > 0 ? static_cast<double>(intensity_mismatch) / checked : 0.0;
+    double mismatch_ratio = checked > 0 ? static_cast<double>(intensity_mismatch) / checked : 0.0;
     EXPECT_LT(mismatch_ratio, 0.01)
       << "Scan " << i << ": " << intensity_mismatch << "/" << checked
       << " matched points have different intensity (" << (mismatch_ratio * 100) << "%)";

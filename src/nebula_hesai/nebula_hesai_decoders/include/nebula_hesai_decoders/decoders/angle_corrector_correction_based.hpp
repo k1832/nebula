@@ -164,10 +164,7 @@ public:
 
 #ifdef NEBULA_CUDA_ENABLED
   /// @brief Get the number of mirror frames for this sensor
-  [[nodiscard]] size_t get_n_frames() const
-  {
-    return correction_ ? correction_->frameNumber : 1;
-  }
+  [[nodiscard]] size_t get_n_frames() const { return correction_ ? correction_->frameNumber : 1; }
 
   /// @brief Get frame angle boundaries for multi-frame CUDA support
   /// @param frame_id Frame index
@@ -177,8 +174,8 @@ public:
   /// @param scan_emit Output: raw azimuth for scan emit
   /// @return true if frame_id is valid
   bool get_frame_angle_info(
-    uint32_t frame_id, uint32_t & fov_start, uint32_t & fov_end,
-    uint32_t & timestamp_reset, uint32_t & scan_emit) const
+    uint32_t frame_id, uint32_t & fov_start, uint32_t & fov_end, uint32_t & timestamp_reset,
+    uint32_t & scan_emit) const
   {
     if (!correction_ || frame_id >= correction_->frameNumber) {
       return false;

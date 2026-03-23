@@ -28,18 +28,12 @@
 
 // C-linkage kernel launcher declaration (defined in hesai_cuda_kernels.cu)
 extern "C" bool launch_decode_hesai_scan_batch(
-  const uint16_t * d_distances_batch,
-  const uint8_t * d_reflectivities_batch,
-  const uint32_t * d_raw_azimuths,
-  const uint32_t * d_n_returns,
-  const uint32_t * d_last_azimuths,
+  const uint16_t * d_distances_batch, const uint8_t * d_reflectivities_batch,
+  const uint32_t * d_raw_azimuths, const uint32_t * d_n_returns, const uint32_t * d_last_azimuths,
   const nebula::drivers::cuda::CudaAngleCorrectionData * d_angle_lut,
   const nebula::drivers::cuda::CudaDecoderConfig & config,
-  nebula::drivers::cuda::CudaNebulaPoint * d_points,
-  uint32_t * d_count,
-  uint32_t n_azimuths,
-  uint32_t n_packets,
-  cudaStream_t stream);
+  nebula::drivers::cuda::CudaNebulaPoint * d_points, uint32_t * d_count, uint32_t n_azimuths,
+  uint32_t n_packets, cudaStream_t stream);
 #endif
 
 #include <nebula_core_common/loggers/logger.hpp>
@@ -128,8 +122,7 @@ private:
   /// @brief Number of azimuth divisions for angle lookup table (LUT resolution)
   static constexpr uint32_t cuda_n_azimuths_ = 36000;  // 0.01 degree resolution
   /// @brief Sensor's native azimuth range (max_azimuth = 360 * degree_subdivisions)
-  static constexpr uint32_t sensor_max_azimuth_ =
-    360 * SensorT::packet_t::degree_subdivisions;
+  static constexpr uint32_t sensor_max_azimuth_ = 360 * SensorT::packet_t::degree_subdivisions;
   /// @brief Scale factor from sensor native azimuth to LUT index
   static constexpr uint32_t azimuth_scale_ = sensor_max_azimuth_ / cuda_n_azimuths_;
 
@@ -301,8 +294,7 @@ private:
     config.max_range = sensor_configuration_->max_range;
     config.sensor_min_range = SensorT::min_range;
     config.sensor_max_range = SensorT::max_range;
-    config.dual_return_distance_threshold =
-      sensor_configuration_->dual_return_distance_threshold;
+    config.dual_return_distance_threshold = sensor_configuration_->dual_return_distance_threshold;
     config.fov_min_rad = deg2rad(sensor_configuration_->cloud_min_angle);
     config.fov_max_rad = deg2rad(sensor_configuration_->cloud_max_angle);
     config.scan_emit_angle_rad = deg2rad(sensor_configuration_->cut_angle);
@@ -333,8 +325,9 @@ private:
 
       for (uint32_t i = 0; i < config.n_frames && i < cuda::MAX_CUDA_FRAMES; ++i) {
         uint32_t fov_start, fov_end, timestamp_reset, scan_emit;
-        if (angle_corrector_.get_frame_angle_info(
-              i, fov_start, fov_end, timestamp_reset, scan_emit)) {
+        if (
+          angle_corrector_.get_frame_angle_info(
+            i, fov_start, fov_end, timestamp_reset, scan_emit)) {
           config.frame_angles[i].fov_start = fov_start;
           config.frame_angles[i].fov_end = fov_end;
           config.frame_angles[i].timestamp_reset = timestamp_reset;
@@ -394,15 +387,13 @@ private:
 
       // in_current_scan=1: belongs to the completed scan (completed_buffer_index)
       // in_current_scan=0: belongs to the next scan (1 - completed_buffer_index)
-      auto & frame = cuda_pt.in_current_scan
-                       ? frame_buffers_[completed_buffer_index]
-                       : frame_buffers_[1 - completed_buffer_index];
+      auto & frame = cuda_pt.in_current_scan ? frame_buffers_[completed_buffer_index]
+                                             : frame_buffers_[1 - completed_buffer_index];
 
       const uint32_t entry_id = cuda_pt.entry_id;
       const uint64_t packet_timestamp_ns =
-        (entry_id < n_entries)
-          ? gpu_scan_buffer_.h_packet_timestamps_staging[entry_id]
-          : hesai_packet::get_timestamp_ns(packet_);
+        (entry_id < n_entries) ? gpu_scan_buffer_.h_packet_timestamps_staging[entry_id]
+                               : hesai_packet::get_timestamp_ns(packet_);
 
       NebulaPoint point;
       point.x = cuda_pt.x;
@@ -450,15 +441,14 @@ private:
 
     // Reset output counter and zero output buffer for deterministic sparse indexing
     cudaMemsetAsync(d_count_, 0, sizeof(uint32_t), cuda_stream_);
-    cudaMemsetAsync(
-      d_points_, 0, sparse_buffer_size * sizeof(cuda::CudaNebulaPoint), cuda_stream_);
+    cudaMemsetAsync(d_points_, 0, sparse_buffer_size * sizeof(cuda::CudaNebulaPoint), cuda_stream_);
 
     // Launch batched kernel
     bool kernel_ok = launch_decode_hesai_scan_batch(
       gpu_scan_buffer_.d_distances_batch, gpu_scan_buffer_.d_reflectivities_batch,
       gpu_scan_buffer_.d_raw_azimuths, gpu_scan_buffer_.d_n_returns,
-      gpu_scan_buffer_.d_last_azimuths, cuda_decoder_->get_angle_lut(), config, d_points_,
-      d_count_, cuda_n_azimuths_, n_entries, cuda_stream_);
+      gpu_scan_buffer_.d_last_azimuths, cuda_decoder_->get_angle_lut(), config, d_points_, d_count_,
+      cuda_n_azimuths_, n_entries, cuda_stream_);
     if (!kernel_ok) {
       NEBULA_LOG_STREAM(logger_->error, "CUDA batched kernel launch failed");
     }
@@ -493,15 +483,13 @@ private:
   {
     const char * cuda_env = std::getenv("NEBULA_USE_CUDA");
     if (!cuda_env || std::string(cuda_env) != "1") {
-      NEBULA_LOG_STREAM(
-        logger_->info, "CUDA decode disabled (set NEBULA_USE_CUDA=1 to enable)");
+      NEBULA_LOG_STREAM(logger_->info, "CUDA decode disabled (set NEBULA_USE_CUDA=1 to enable)");
       return;
     }
 
     cudaError_t err = cudaStreamCreate(&cuda_stream_);
     if (err != cudaSuccess) {
-      NEBULA_LOG_STREAM(
-        logger_->warn, "Failed to create CUDA stream: " << cudaGetErrorString(err));
+      NEBULA_LOG_STREAM(logger_->warn, "Failed to create CUDA stream: " << cudaGetErrorString(err));
       return;
     }
 
@@ -582,8 +570,7 @@ private:
                  cudaMallocHost(&h_pinned_distances_, cuda_buffer_size_ * sizeof(uint16_t)),
                  "pinned distances buffer");
     ok = ok && alloc_ok(
-                 cudaMallocHost(
-                   &h_pinned_reflectivities_, cuda_buffer_size_ * sizeof(uint8_t)),
+                 cudaMallocHost(&h_pinned_reflectivities_, cuda_buffer_size_ * sizeof(uint8_t)),
                  "pinned reflectivities buffer");
 
     if (!ok) return;
@@ -615,21 +602,20 @@ private:
                              &gpu_scan_buffer_.d_reflectivities_batch,
                              MAX_PACKETS_PER_SCAN * packet_data_size * sizeof(uint8_t)),
                            "scan reflectivities buffer");
-    scan_ok = scan_ok && alloc_scan_ok(
-                           cudaMalloc(
-                             &gpu_scan_buffer_.d_raw_azimuths,
-                             MAX_PACKETS_PER_SCAN * sizeof(uint32_t)),
-                           "scan azimuths buffer");
-    scan_ok = scan_ok && alloc_scan_ok(
-                           cudaMalloc(
-                             &gpu_scan_buffer_.d_n_returns,
-                             MAX_PACKETS_PER_SCAN * sizeof(uint32_t)),
-                           "scan n_returns buffer");
-    scan_ok = scan_ok && alloc_scan_ok(
-                           cudaMalloc(
-                             &gpu_scan_buffer_.d_last_azimuths,
-                             MAX_PACKETS_PER_SCAN * sizeof(uint32_t)),
-                           "scan last_azimuths buffer");
+    scan_ok =
+      scan_ok &&
+      alloc_scan_ok(
+        cudaMalloc(&gpu_scan_buffer_.d_raw_azimuths, MAX_PACKETS_PER_SCAN * sizeof(uint32_t)),
+        "scan azimuths buffer");
+    scan_ok = scan_ok &&
+              alloc_scan_ok(
+                cudaMalloc(&gpu_scan_buffer_.d_n_returns, MAX_PACKETS_PER_SCAN * sizeof(uint32_t)),
+                "scan n_returns buffer");
+    scan_ok =
+      scan_ok &&
+      alloc_scan_ok(
+        cudaMalloc(&gpu_scan_buffer_.d_last_azimuths, MAX_PACKETS_PER_SCAN * sizeof(uint32_t)),
+        "scan last_azimuths buffer");
     // Pinned host staging buffers
     scan_ok = scan_ok && alloc_scan_ok(
                            cudaMallocHost(
@@ -646,11 +632,11 @@ private:
                              &gpu_scan_buffer_.h_raw_azimuths_staging,
                              MAX_PACKETS_PER_SCAN * sizeof(uint32_t)),
                            "pinned scan azimuths staging");
-    scan_ok = scan_ok && alloc_scan_ok(
-                           cudaMallocHost(
-                             &gpu_scan_buffer_.h_n_returns_staging,
-                             MAX_PACKETS_PER_SCAN * sizeof(uint32_t)),
-                           "pinned scan n_returns staging");
+    scan_ok = scan_ok &&
+              alloc_scan_ok(
+                cudaMallocHost(
+                  &gpu_scan_buffer_.h_n_returns_staging, MAX_PACKETS_PER_SCAN * sizeof(uint32_t)),
+                "pinned scan n_returns staging");
     scan_ok = scan_ok && alloc_scan_ok(
                            cudaMallocHost(
                              &gpu_scan_buffer_.h_last_azimuths_staging,
@@ -700,25 +686,22 @@ private:
     // Compute cached raw angle values for GPU config
     if constexpr (SensorT::uses_calibration_based_angles) {
       is_multi_frame_sensor_ = false;
-      auto [emit_raw, reset_raw, fov_start_raw, fov_end_raw] =
-        angle_corrector_.get_cuda_raw_angles(
-          sensor_configuration_->cloud_min_angle, sensor_configuration_->cloud_max_angle,
-          sensor_configuration_->cut_angle);
+      auto [emit_raw, reset_raw, fov_start_raw, fov_end_raw] = angle_corrector_.get_cuda_raw_angles(
+        sensor_configuration_->cloud_min_angle, sensor_configuration_->cloud_max_angle,
+        sensor_configuration_->cut_angle);
       cuda_emit_angle_raw_ = emit_raw;
       cuda_timestamp_reset_angle_raw_ = reset_raw;
     } else {
       is_multi_frame_sensor_ = true;
       size_t n_frames = angle_corrector_.get_n_frames();
       NEBULA_LOG_STREAM(
-        logger_->info,
-        "CUDA: Detected multi-frame sensor with " << n_frames << " frames");
+        logger_->info, "CUDA: Detected multi-frame sensor with " << n_frames << " frames");
     }
 
     cuda_enabled_ = true;
     NEBULA_LOG_STREAM(
       logger_->info, "CUDA decoder initialized successfully with "
-                       << n_channels << " channels and " << cuda_n_azimuths_
-                       << " azimuth divisions"
+                       << n_channels << " channels and " << cuda_n_azimuths_ << " azimuth divisions"
                        << (is_multi_frame_sensor_ ? " (multi-frame)" : ""));
   }
 #endif  // NEBULA_CUDA_ENABLED
