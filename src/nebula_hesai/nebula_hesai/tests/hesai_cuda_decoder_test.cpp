@@ -134,9 +134,9 @@ TEST(HesaiCudaDecoderTest, OT128_GpuVsCpuEquivalence)
 
     // For each GPU point, find nearest CPU point (brute-force — clouds are small enough)
     size_t matched = 0;
-    for (const auto & gp : gpu_cloud->points) {
+    for (const auto & gp : *gpu_cloud) {
       float best = std::numeric_limits<float>::max();
-      for (const auto & cp : cpu_cloud->points) {
+      for (const auto & cp : *cpu_cloud) {
         float d = sq_dist(gp, cp);
         if (d < best) best = d;
         if (d < tol_sq) break;  // early exit — found a match
@@ -173,7 +173,7 @@ TEST(HesaiCudaDecoderTest, OT128_GpuFieldValidity)
   ASSERT_GT(gpu_scans.size(), 0u);
 
   for (size_t i = 0; i < gpu_scans.size(); ++i) {
-    for (const auto & pt : gpu_scans[i].cloud->points) {
+    for (const auto & pt : *gpu_scans[i].cloud) {
       // Distance must be positive (all valid points)
       float dist = std::sqrt(pt.x * pt.x + pt.y * pt.y + pt.z * pt.z);
       EXPECT_GT(dist, 0.f) << "Scan " << i << ": zero-distance point found";
@@ -213,8 +213,8 @@ TEST(HesaiCudaDecoderTest, OT128_IntensityExactMatch)
   ASSERT_EQ(cpu_scans.size(), gpu_scans.size());
 
   for (size_t i = 0; i < cpu_scans.size(); ++i) {
-    const auto & cpu_pts = cpu_scans[i].cloud->points;
-    const auto & gpu_pts = gpu_scans[i].cloud->points;
+    const auto & cpu_pts = *cpu_scans[i].cloud;
+    const auto & gpu_pts = *gpu_scans[i].cloud;
 
     // For each GPU point, find the nearest CPU match and verify intensity is identical.
     // Only compare points that have a close spatial match (same physical point).
