@@ -51,6 +51,7 @@ extern "C" bool launch_decode_hesai_scan_batch(
 #include <cstdlib>
 #include <memory>
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -1016,11 +1017,12 @@ public:
 #ifdef NEBULA_CUDA_ENABLED
         if (cuda_enabled_ && use_scan_batching_) {
           accumulate_packet_to_gpu_buffer(block_id, n_returns);
-        } else
+        } else {  // NOLINT(readability/braces)
 #endif
-        {
           convert_returns(block_id, n_returns, scan_state);
+#ifdef NEBULA_CUDA_ENABLED
         }
+#endif
       }
 
 #ifdef NEBULA_CUDA_ENABLED
