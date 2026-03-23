@@ -198,8 +198,8 @@ public:
         // has a difference of millions of bytes, well above this threshold.
         if (actual < buf_size && (buf_size - actual) > 4096) {
           throw SocketError(
-            "SO_RCVBUF was clamped by the kernel: requested " +
-            std::to_string(buf_size) + " bytes, got " + std::to_string(actual) +
+            "SO_RCVBUF was clamped by the kernel: requested " + std::to_string(buf_size) +
+            " bytes, got " + std::to_string(actual) +
             " bytes. Increase net.core.rmem_max: sudo sysctl -w net.core.rmem_max=" +
             std::to_string(buf_size));
         }
