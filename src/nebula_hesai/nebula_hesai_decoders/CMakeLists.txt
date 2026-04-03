@@ -25,15 +25,6 @@ if(BUILD_CUDA)
       set(CMAKE_CUDA_ARCHITECTURES "75;86;87;89" CACHE STRING "CUDA architectures" FORCE)
     endif()
 
-    # Check if CUDA kernel source exists
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/hesai_cuda_kernels.cu")
-      set(CUDA_KERNELS_EXIST TRUE)
-      message(STATUS "CUDA kernel source found, will build CUDA decoder")
-    else()
-      set(CUDA_KERNELS_EXIST FALSE)
-      message(WARNING "CUDA kernel source (src/cuda/hesai_cuda_kernels.cu) not found")
-      message(WARNING "Building without CUDA decoder support")
-    endif()
   endif()
 endif()
 
@@ -53,7 +44,7 @@ target_link_libraries(
          Boost::headers)
 
 # CUDA Decoder library
-if(BUILD_CUDA AND CUDA_KERNELS_EXIST)
+if(BUILD_CUDA)
   enable_language(CUDA)
 
   set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3 -diag-suppress 20012")

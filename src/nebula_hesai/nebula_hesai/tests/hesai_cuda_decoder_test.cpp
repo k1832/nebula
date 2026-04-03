@@ -16,14 +16,9 @@
 /// @brief GPU-vs-CPU equivalence tests for the Hesai CUDA decoder (OT128 / Pandar128E4X).
 ///
 /// Decodes the same rosbag with the CPU path (NEBULA_USE_CUDA unset) and the GPU path
-/// (NEBULA_USE_CUDA=1), then compares the resulting point clouds with tolerances.
-/// The GPU path differs at scan boundaries due to different overlap/FOV detection logic
-/// in the GPU kernel vs the CPU's ScanCutter.
-///
-/// Tolerances were derived from a single OT128 rosbag (ot128/1730271167765338806):
-///   - Scan 0: CPU=70275, GPU=72125 (diff=1850)
-///   - Scan 1: CPU=72240, GPU=72185 (diff=55)
-/// If additional rosbags show larger boundary diffs, tolerances may need adjustment.
+/// (NEBULA_USE_CUDA=1), then compares the resulting point clouds.
+/// The GPU path uses CPU-authoritative scan cutting (via scan_state flags), so scan
+/// boundaries are identical between CPU and GPU.
 
 #include "hesai_ros_decoder_test.hpp"
 
@@ -59,16 +54,14 @@ static const nebula::ros::HesaiRosDecoderTestParams OT128_CONFIG = {
   300.f};
 
 // Maximum allowed difference in point count between GPU and CPU per scan.
-// The GPU kernel assigns scan-boundary points differently than the CPU's ScanCutter,
-// causing up to ~2000 points to shift between adjacent scans.
-// Observed max diff: 1850 (scan 0 of test rosbag). Set to 2000 for ~8% headroom.
-static constexpr int kMaxPointCountDiff = 2000;
+// GPU uses CPU-authoritative scan_state, so scan cutting is identical.
+static constexpr int kMaxPointCountDiff = 0;
 // Coordinate tolerance (metres) for nearest-neighbour matching.
-// GPU uses pre-computed LUT with 0.01-degree resolution; small rounding differences expected.
-static constexpr float kXyzTolerance = 5e-3f;
+// GPU and CPU use the same angle LUT, but floating-point hardware differences
+// (e.g. FMA rounding on GPU vs CPU) cause sub-millimetre coordinate differences.
+static constexpr float kXyzTolerance = 1e-4f;  // 0.1 mm
 // Fraction of GPU points that must have a CPU match within tolerance.
-// ~2-3% of points are at scan boundaries and may not have an exact match.
-static constexpr double kMinMatchRatio = 0.97;
+static constexpr double kMinMatchRatio = 1.0;
 
 /// Decoded scan: message timestamp + point cloud
 struct DecodedScan
