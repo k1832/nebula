@@ -600,8 +600,6 @@ public:
 #endif
   }
 
-  // unique_ptr<HesaiScanDecoderCuda> handles CUDA resource cleanup automatically
-
   void set_pointcloud_callback(pointcloud_callback_t callback) override
   {
     pointcloud_callback_ = std::move(callback);

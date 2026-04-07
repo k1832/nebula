@@ -226,13 +226,15 @@ public:
       return false;
     }
 
-    err = cudaMemcpy(d_angle_lut_, angle_lut.data(), lut_size, cudaMemcpyHostToDevice);
+    err =
+      cudaMemcpyAsync(d_angle_lut_, angle_lut.data(), lut_size, cudaMemcpyHostToDevice, stream_);
     if (err != cudaSuccess) {
       fprintf(stderr, "CUDA: Failed to upload angle LUT: %s\n", cudaGetErrorString(err));
       cudaFree(d_angle_lut_);
       d_angle_lut_ = nullptr;
       return false;
     }
+    cudaStreamSynchronize(stream_);
 
     return true;
   }
@@ -318,19 +320,19 @@ public:
       return 0;
     }
 
-    cudaStreamSynchronize(stream_);
-
+    // Copy count and sparse buffer back to host using the same stream.
+    // All operations on a stream execute in order, so no explicit sync needed before these copies.
     uint32_t valid_point_count = 0;
-    cudaMemcpy(&valid_point_count, d_count_, sizeof(uint32_t), cudaMemcpyDeviceToHost);
+    cudaMemcpyAsync(
+      &valid_point_count, d_count_, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream_);
 
-    if (valid_point_count > 0) {
-      // Copy sparse buffer to host
-      const uint32_t copy_size =
-        std::min(sparse_buffer_size, static_cast<uint32_t>(host_point_buffer_.size()));
-      cudaMemcpy(
-        host_point_buffer_.data(), d_points_, copy_size * sizeof(CudaNebulaPoint),
-        cudaMemcpyDeviceToHost);
-    }
+    const uint32_t copy_size =
+      std::min(sparse_buffer_size, static_cast<uint32_t>(host_point_buffer_.size()));
+    cudaMemcpyAsync(
+      host_point_buffer_.data(), d_points_, copy_size * sizeof(CudaNebulaPoint),
+      cudaMemcpyDeviceToHost, stream_);
+
+    cudaStreamSynchronize(stream_);
 
     return valid_point_count;
   }

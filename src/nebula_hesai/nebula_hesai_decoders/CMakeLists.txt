@@ -75,12 +75,7 @@ if(BUILD_CUDA)
   target_compile_definitions(nebula_hesai_decoders_cuda PUBLIC NEBULA_CUDA_ENABLED)
   target_compile_definitions(nebula_hesai_decoders PUBLIC NEBULA_CUDA_ENABLED)
 
-  # Add CUDA include directories to main library for header resolution
-  target_include_directories(nebula_hesai_decoders
-    PUBLIC ${CUDAToolkit_INCLUDE_DIRS})
-
-  # Link CUDA library to main library (CUDA::cudart is PRIVATE so it won't
-  # propagate the imported target to downstream packages that lack CUDAToolkit)
+  # Link CUDA library to main library
   target_link_libraries(nebula_hesai_decoders
     PUBLIC nebula_hesai_decoders_cuda
     PRIVATE CUDA::cudart)

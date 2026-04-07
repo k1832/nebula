@@ -41,7 +41,7 @@ __device__ __forceinline__ bool should_filter_duplicate_return(
     if (raw_distance == last_raw_distance && reflectivity == last_reflectivity) return true;
 
     const float last_distance = static_cast<float>(last_raw_distance) * dis_unit;
-    if (fabsf(distance - last_distance) < threshold) return true;
+    return (fabsf(distance - last_distance) < threshold);
   } else {
     for (uint32_t other_ret = 0; other_ret < n_returns; ++other_ret) {
       if (other_ret == return_id) continue;

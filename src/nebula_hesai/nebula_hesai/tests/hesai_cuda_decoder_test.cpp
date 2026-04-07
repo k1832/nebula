@@ -269,10 +269,21 @@ TEST(HesaiCudaDecoderTest, SkippedNoCuda)
 int main(int argc, char * argv[])
 {
   rclcpp::init(argc, argv);
+
+  // Save original env value so we can restore it after tests
+  const char * original_cuda_env = std::getenv("NEBULA_USE_CUDA");
+  const std::string saved_cuda_env = original_cuda_env ? original_cuda_env : "";
+
   ::testing::InitGoogleTest(&argc, argv);
   int result = RUN_ALL_TESTS();
-  // Restore env
-  unsetenv("NEBULA_USE_CUDA");
+
+  // Restore original env
+  if (saved_cuda_env.empty()) {
+    unsetenv("NEBULA_USE_CUDA");
+  } else {
+    setenv("NEBULA_USE_CUDA", saved_cuda_env.c_str(), 1);
+  }
+
   rclcpp::shutdown();
   return result;
 }
